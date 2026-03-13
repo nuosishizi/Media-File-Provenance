@@ -1,6 +1,7 @@
 # mam_gui.py — 主界面（纯 UI，业务逻辑见 mam_core / mam_db / mam_meta）
 import sys
 import os
+import re
 import json
 import cv2
 import warnings
@@ -17,7 +18,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTabWidget, QTableWidget, QTableWidgetItem,
     QMessageBox, QFormLayout, QFrame, QTextEdit, QHeaderView, QScrollArea,
-    QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QSplitter, QComboBox
+    QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QSplitter, QComboBox,
+    QFileDialog, QProgressBar
 )
 from PyQt6.QtCore  import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui   import QPixmap, QImage, QColor, QFont
@@ -142,6 +144,112 @@ class DropArea(QFrame):
     def file(self):  return self._files[0] if self._files else None
 
 # ─────────────────────────────────────────────────────
+# 批量扫描线程（支持随时停止）
+# ─────────────────────────────────────────────────────
+class ScanWorker(QThread):
+    progress = pyqtSignal(int, int, int, int, int)  # total, done, added, skipped, failed
+    log_line = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+
+    def __init__(self, folder, operator, known_phashes):
+        super().__init__()
+        self._folder       = folder
+        self._operator     = operator
+        self._known        = set(known_phashes)   # 线程内独立副本
+        self._should_stop  = False
+
+    def stop(self):
+        self._should_stop = True
+
+    def run(self):
+        folder      = self._folder
+        folder_name = os.path.basename(folder.rstrip('/\\'))
+        # 自动识别 Canva 文件夹名中的 【ID】
+        m_id        = re.search(r'【(\d+)】', folder_name)
+        canva_id    = m_id.group(1) if m_id else None
+        canva_name  = re.sub(r'【\d+】', '', folder_name).strip() if m_id else None
+
+        # ── 遍历收集所有媒体文件 ────────────────────────
+        self.log_line.emit(f"📂 正在扫描文件列表: {folder}")
+        all_files = []
+        for rt, _, fs in os.walk(folder):
+            for f in fs:
+                if f.lower().endswith(ALL_EXTS):
+                    all_files.append(os.path.join(rt, f))
+        total = len(all_files)
+        if canva_id:
+            self.log_line.emit(f"📋 发现 {total} 个媒体文件  |  🎨 Canva模板ID: 【{canva_id}】")
+        else:
+            self.log_line.emit(f"📋 发现 {total} 个媒体文件")
+        if total == 0:
+            self.finished.emit({'total': 0, 'added': 0, 'skipped': 0,
+                                'failed': 0, 'canva_id': canva_id, 'stopped': False})
+            return
+
+        added = skipped = failed = 0
+        canva_phashes = []
+
+        for i, fp in enumerate(all_files):
+            if self._should_stop:
+                break
+            try:
+                img = get_thumbnail(fp)
+                if img is None:
+                    failed += 1
+                    self.progress.emit(total, i + 1, added, skipped, failed)
+                    continue
+                ph, _ = get_phash_from_file(fp, img)
+                if not ph:
+                    failed += 1
+                    self.progress.emit(total, i + 1, added, skipped, failed)
+                    continue
+                if ph in self._known:
+                    skipped += 1
+                    if canva_id:
+                        canva_phashes.append(ph)
+                    self.progress.emit(total, i + 1, added, skipped, failed)
+                    continue
+                # 新素材 → 注册并写入元数据
+                fname = os.path.basename(fp)
+                atype = get_asset_type(fp)
+                fsize = get_file_size(fp)
+                now   = datetime.now()
+                rec   = {"phash": ph, "filename": fname, "asset_type": atype,
+                         "file_size": fsize, "producer": self._operator,
+                         "created_at": now.isoformat()}
+                write_metadata(fp, rec)
+                db.upsert_asset(ph, fname, atype, fsize, self._operator, now,
+                                json.dumps(rec, ensure_ascii=False, default=str),
+                                make_thumb_bytes(img))
+                self._known.add(ph)
+                if canva_id:
+                    canva_phashes.append(ph)
+                added += 1
+                if added % 50 == 1:
+                    self.log_line.emit(f"✅ 新增: {fname[:45]}  phash:{ph}")
+            except Exception as e:
+                failed += 1
+                self.log_line.emit(f"❌ {os.path.basename(fp)}: {str(e)[:80]}")
+            self.progress.emit(total, i + 1, added, skipped, failed)
+
+        # ── Canva 模板自动登记 ───────────────────────────
+        if canva_id and canva_phashes:
+            try:
+                unique_ph = list(dict.fromkeys(canva_phashes))
+                db.add_canva_template(canva_id, canva_name, self._operator, unique_ph)
+                self.log_line.emit(
+                    f"🎨 Canva模板【{canva_id}】({canva_name}) 已登记，关联{len(unique_ph)}个素材"
+                )
+            except Exception as e:
+                self.log_line.emit(f"⚠️ Canva模板登记失败: {e}")
+
+        self.finished.emit({
+            'total': total, 'added': added, 'skipped': skipped,
+            'failed': failed, 'canva_id': canva_id, 'stopped': self._should_stop
+        })
+
+
+# ─────────────────────────────────────────────────────
 # 后台线程
 # ─────────────────────────────────────────────────────
 class Worker(QThread):
@@ -195,6 +303,7 @@ class MamApp(QMainWindow):
         tabs.addTab(self._tab_canva(),     "  Canva模板 ")
         tabs.addTab(self._tab_query(),     "  溯源查询  ")
         tabs.addTab(self._tab_library(),   "  全量库    ")
+        tabs.addTab(self._tab_batch_scan(),  "  批量扫描  ")
         vbox.addWidget(tabs)
 
         self._log_box = QTextEdit(); self._log_box.setReadOnly(True)
@@ -691,6 +800,119 @@ class MamApp(QMainWindow):
             ok, msg = db.connect()
             self._lbl_user.setText(f"👤  操作员：{self._cfg['user_name']}")
             self._log("✅ 设置保存，数据库重连" + ("成功" if ok else f"失败: {msg}"))
+
+
+    # ── Tab7：批量扫描 ─────────────────────────────────
+    def _tab_batch_scan(self):
+        w = QWidget(); v = QVBoxLayout(w)
+        desc = QLabel(
+            "批量扫描文件夹，将所有媒体文件自动登记入库。\n"
+            "若文件夹名含 【XXXXXX】（如：夏日咖啡【20260314112847402】），\n"
+            "自动识别为 Canva 文件夹并建立模板关联，无需手动登记。"
+        )
+        desc.setStyleSheet("color:#555;font-size:12px;padding:4px;")
+        v.addWidget(desc)
+
+        # 文件夹路径
+        fr = QHBoxLayout()
+        fr.addWidget(QLabel("扫描文件夹："))
+        self._scan_path = QLineEdit()
+        self._scan_path.setPlaceholderText("粘贴路径，或点击右侧选择…")
+        fr.addWidget(self._scan_path)
+        btn_br = QPushButton("📂 选择"); btn_br.setFixedWidth(80)
+        btn_br.clicked.connect(self._browse_scan_folder)
+        fr.addWidget(btn_br); v.addLayout(fr)
+
+        # 操作按钮
+        br = QHBoxLayout()
+        self._btn_scan_start = QPushButton("▶  开始扫描")
+        self._btn_scan_start.setStyleSheet(
+            "background:#27ae60;color:#fff;height:40px;font-size:14px;")
+        self._btn_scan_start.clicked.connect(self._do_scan_start)
+        self._btn_scan_stop = QPushButton("⏹  停止")
+        self._btn_scan_stop.setStyleSheet(
+            "background:#c0392b;color:#fff;height:40px;font-size:14px;")
+        self._btn_scan_stop.setEnabled(False)
+        self._btn_scan_stop.clicked.connect(self._do_scan_stop)
+        br.addWidget(self._btn_scan_start); br.addWidget(self._btn_scan_stop)
+        br.addStretch(); v.addLayout(br)
+
+        # 进度条
+        self._scan_bar = QProgressBar()
+        self._scan_bar.setRange(0, 100); self._scan_bar.setValue(0)
+        self._scan_bar.setTextVisible(True)
+        self._scan_bar.setStyleSheet("height:20px;")
+        v.addWidget(self._scan_bar)
+
+        # 统计标签
+        self._scan_stats = QLabel("等待开始…")
+        self._scan_stats.setStyleSheet(
+            "font-size:13px;color:#2c3e50;padding:4px;"
+            "background:#ecf0f1;border-radius:4px;")
+        v.addWidget(self._scan_stats)
+
+        # 扫描日志（独立于主日志）
+        self._scan_log = QTextEdit(); self._scan_log.setReadOnly(True)
+        self._scan_log.setStyleSheet(
+            "background:#0d1117;color:#58a6ff;font-size:11px;font-family:Consolas,monospace;")
+        v.addWidget(self._scan_log)
+        return w
+
+    def _browse_scan_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "选择扫描文件夹")
+        if d:
+            self._scan_path.setText(d)
+
+    def _do_scan_start(self):
+        folder = self._scan_path.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "提示", "请输入或选择有效的文件夹路径"); return
+        if not db.conn:
+            QMessageBox.warning(self, "提示", "数据库未连接，请先在【系统设置】中连接"); return
+        op = self._cfg['user_name']
+        self._scan_log.clear()
+        self._scan_bar.setValue(0)
+        self._scan_stats.setText("正在加载数据库已有素材列表…")
+        known = db.get_all_phashes()
+        self._scan_stats.setText(f"数据库已有 {len(known)} 个素材，开始扫描…")
+        self._scan_worker = ScanWorker(folder, op, known)
+        self._scan_worker.progress.connect(self._on_scan_progress)
+        self._scan_worker.log_line.connect(self._scan_log.append)
+        self._scan_worker.finished.connect(self._on_scan_done)
+        self._scan_worker.start()
+        self._btn_scan_start.setEnabled(False)
+        self._btn_scan_stop.setEnabled(True)
+
+    def _do_scan_stop(self):
+        if hasattr(self, '_scan_worker') and self._scan_worker.isRunning():
+            self._scan_worker.stop()
+            self._btn_scan_stop.setEnabled(False)
+            self._scan_stats.setText("正在停止，等待当前文件处理完毕…")
+
+    def _on_scan_progress(self, total, done, added, skipped, failed):
+        pct = int(done / total * 100) if total else 0
+        self._scan_bar.setValue(pct)
+        self._scan_stats.setText(
+            f"进度: {done} / {total}  |  "
+            f"✅ 新增 {added}  |  ⏭ 跳过 {skipped}  |  ❌ 失败 {failed}"
+        )
+
+    def _on_scan_done(self, result):
+        self._btn_scan_start.setEnabled(True)
+        self._btn_scan_stop.setEnabled(False)
+        if not result.get('stopped'):
+            self._scan_bar.setValue(100)
+        status = "⏸ 已手动停止" if result.get('stopped') else "✅ 扫描完成"
+        msg = (f"{status}  |  总计 {result['total']} 个文件  |  "
+               f"✅ 新增 {result['added']}  |  "
+               f"⏭ 跳过 {result['skipped']}  |  "
+               f"❌ 失败 {result['failed']}")
+        if result.get('canva_id'):
+            msg += f"  |  🎨 Canva【{result['canva_id']}】已登记"
+        self._scan_stats.setText(msg)
+        self._scan_log.append(f"\n{'─' * 60}\n{msg}")
+        self._log(msg)
+        self._refresh_lib()
 
 
 if __name__ == "__main__":

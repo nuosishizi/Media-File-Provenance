@@ -461,3 +461,11 @@ class DBManager:
                 "SELECT * FROM canva_templates ORDER BY created_at DESC"
             )
             return cur.fetchall()
+
+    def get_all_phashes(self):
+        """返回数据库中所有已有 phash 的集合（用于批量扫描快速去重，避免逐条查询）"""
+        if not self.conn:
+            return set()
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT phash FROM assets")
+            return {r['phash'] for r in cur.fetchall()}
