@@ -10,7 +10,8 @@ from datetime import datetime
 
 from mam_core import (load_config, save_config, get_phash, get_thumbnail,
                        get_file_size, get_asset_type, make_thumb_bytes,
-                       hamming, ALL_EXTS, IMG_EXTS, VID_EXTS)
+                       hamming, ALL_EXTS, IMG_EXTS, VID_EXTS,
+                       load_producer_codes, save_producer_codes, parse_producer_from_filename)
 from mam_db   import DBManager
 from mam_meta import write_metadata, read_metadata, get_phash_from_file, check_deps, exiftool_status
 
@@ -151,11 +152,12 @@ class ScanWorker(QThread):
     log_line = pyqtSignal(str)
     finished = pyqtSignal(dict)
 
-    def __init__(self, folder, operator, known_phashes):
+    def __init__(self, folder, operator, known_phashes, code_map=None):
         super().__init__()
         self._folder       = folder
         self._operator     = operator
         self._known        = set(known_phashes)   # 线程内独立副本
+        self._code_map     = code_map or {}
         self._should_stop  = False
 
     def stop(self):
@@ -210,15 +212,16 @@ class ScanWorker(QThread):
                     self.progress.emit(total, i + 1, added, skipped, failed)
                     continue
                 # 新素材 → 注册并写入元数据
-                fname = os.path.basename(fp)
-                atype = get_asset_type(fp)
-                fsize = get_file_size(fp)
-                now   = datetime.now()
+                fname    = os.path.basename(fp)
+                atype    = get_asset_type(fp)
+                fsize    = get_file_size(fp)
+                now      = datetime.now()
+                producer = parse_producer_from_filename(fname, self._code_map)
                 rec   = {"phash": ph, "filename": fname, "asset_type": atype,
-                         "file_size": fsize, "producer": self._operator,
+                         "file_size": fsize, "producer": producer,
                          "created_at": now.isoformat()}
                 write_metadata(fp, rec)
-                db.upsert_asset(ph, fname, atype, fsize, self._operator, now,
+                db.upsert_asset(ph, fname, atype, fsize, producer, now,
                                 json.dumps(rec, ensure_ascii=False, default=str),
                                 make_thumb_bytes(img))
                 self._known.add(ph)
@@ -805,10 +808,50 @@ class MamApp(QMainWindow):
     # ── Tab7：批量扫描 ─────────────────────────────────
     def _tab_batch_scan(self):
         w = QWidget(); v = QVBoxLayout(w)
+
+        # ─── 人员代码管理区 ──────────────────────────────
+        code_box = QFrame()
+        code_box.setStyleSheet(
+            "QFrame{border:1px solid #bdc3c7;border-radius:6px;"
+            "background:#f8f9fa;padding:4px;margin-bottom:4px;}")
+        cv = QVBoxLayout(code_box)
+        cv.addWidget(QLabel("👤  人员代码对照表  （文件名中的CODE → 真实姓名）"))
+
+        # 表格：展示层
+        self._code_table = QTableWidget(0, 3)
+        self._code_table.setHorizontalHeaderLabels(["CODE", "真实姓名", "操作"])
+        self._code_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._code_table.setMaximumHeight(160)
+        self._code_table.setAlternatingRowColors(True)
+        cv.addWidget(self._code_table)
+
+        # 添加行
+        add_row = QHBoxLayout()
+        self._code_input = QLineEdit(); self._code_input.setPlaceholderText("CODE（如 KS、57）")
+        self._code_input.setFixedWidth(100)
+        self._name_input = QLineEdit(); self._name_input.setPlaceholderText("真实姓名（如 张三）")
+        self._name_input.setFixedWidth(150)
+        btn_add_code = QPushButton("➕ 添加")
+        btn_add_code.setFixedWidth(70)
+        btn_add_code.clicked.connect(self._add_producer_code)
+        btn_save_codes = QPushButton("💾 保存")
+        btn_save_codes.setFixedWidth(70)
+        btn_save_codes.clicked.connect(self._save_producer_codes)
+        add_row.addWidget(QLabel("CODE:"))
+        add_row.addWidget(self._code_input)
+        add_row.addWidget(QLabel("姓名:"))
+        add_row.addWidget(self._name_input)
+        add_row.addWidget(btn_add_code)
+        add_row.addWidget(btn_save_codes)
+        add_row.addStretch()
+        cv.addLayout(add_row)
+        v.addWidget(code_box)
+        self._load_code_table()  # 初始化载入已保存的表
+
         desc = QLabel(
-            "批量扫描文件夹，将所有媒体文件自动登记入库。\n"
-            "若文件夹名含 【XXXXXX】（如：夏日咖啡【20260314112847402】），\n"
-            "自动识别为 Canva 文件夹并建立模板关联，无需手动登记。"
+            "批量扫描文件夹，将所有媒体文件自动登记入库。"
+            "文件名中的CODE会自动匹配制作人，识别不到则写入「未知」。"
+            "文件夹名含【ID】自动建立 Canva 模板关联。"
         )
         desc.setStyleSheet("color:#555;font-size:12px;padding:4px;")
         v.addWidget(desc)
@@ -863,6 +906,65 @@ class MamApp(QMainWindow):
         if d:
             self._scan_path.setText(d)
 
+    def _load_code_table(self):
+        """从文件加载人员代码表并填充到 QTableWidget"""
+        codes = load_producer_codes()
+        self._code_table.setRowCount(0)
+        for code, name in codes.items():
+            self._insert_code_row(code, name)
+
+    def _insert_code_row(self, code, name):
+        idx = self._code_table.rowCount()
+        self._code_table.insertRow(idx)
+        self._code_table.setItem(idx, 0, QTableWidgetItem(code))
+        self._code_table.setItem(idx, 1, QTableWidgetItem(name))
+        btn_del = QPushButton("🗑")
+        btn_del.setFixedWidth(32)
+        btn_del.clicked.connect(lambda _, r=idx: self._del_code_row(r))
+        self._code_table.setCellWidget(idx, 2, btn_del)
+
+    def _del_code_row(self, row):
+        # 按钮绑定的行号可能因删除偏移，重新找
+        btn = self.sender()
+        for r in range(self._code_table.rowCount()):
+            if self._code_table.cellWidget(r, 2) is btn:
+                self._code_table.removeRow(r); break
+
+    def _add_producer_code(self):
+        code = self._code_input.text().strip().upper()
+        name = self._name_input.text().strip()
+        if not code or not name:
+            QMessageBox.warning(self, "提示", "CODE 和姓名不能为空"); return
+        # 检查是否已存在
+        for r in range(self._code_table.rowCount()):
+            if self._code_table.item(r, 0) and \
+               self._code_table.item(r, 0).text().upper() == code:
+                self._code_table.item(r, 1).setText(name)
+                self._code_input.clear(); self._name_input.clear()
+                return
+        self._insert_code_row(code, name)
+        self._code_input.clear(); self._name_input.clear()
+
+    def _save_producer_codes(self):
+        codes = {}
+        for r in range(self._code_table.rowCount()):
+            k = self._code_table.item(r, 0)
+            v = self._code_table.item(r, 1)
+            if k and v and k.text().strip():
+                codes[k.text().strip().upper()] = v.text().strip()
+        save_producer_codes(codes)
+        self._log(f"✅ 人员代码表已保存，共 {len(codes)} 条")
+
+    def _get_code_map(self) -> dict:
+        """从当前表格读取 code_map（不依赖磁盘文件，实时生效）"""
+        codes = {}
+        for r in range(self._code_table.rowCount()):
+            k = self._code_table.item(r, 0)
+            v = self._code_table.item(r, 1)
+            if k and v and k.text().strip():
+                codes[k.text().strip().upper()] = v.text().strip()
+        return codes
+
     def _do_scan_start(self):
         folder = self._scan_path.text().strip()
         if not folder or not os.path.isdir(folder):
@@ -870,12 +972,13 @@ class MamApp(QMainWindow):
         if not db.conn:
             QMessageBox.warning(self, "提示", "数据库未连接，请先在【系统设置】中连接"); return
         op = self._cfg['user_name']
+        code_map = self._get_code_map()
         self._scan_log.clear()
         self._scan_bar.setValue(0)
         self._scan_stats.setText("正在加载数据库已有素材列表…")
         known = db.get_all_phashes()
         self._scan_stats.setText(f"数据库已有 {len(known)} 个素材，开始扫描…")
-        self._scan_worker = ScanWorker(folder, op, known)
+        self._scan_worker = ScanWorker(folder, op, known, code_map)
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.log_line.connect(self._scan_log.append)
         self._scan_worker.finished.connect(self._on_scan_done)

@@ -10,8 +10,54 @@ IMG_EXTS = ('.png', '.jpg', '.jpeg', '.webp')
 VID_EXTS = ('.mp4', '.mov', '.avi', '.mkv', '.webm')
 ALL_EXTS  = IMG_EXTS + VID_EXTS
 
-CONFIG_FILE    = "mam_config.json"
-DB_CONFIG_FILE = "mam_db_config.json"
+CONFIG_FILE       = "mam_config.json"
+DB_CONFIG_FILE    = "mam_db_config.json"
+PRODUCER_CODE_FILE = "mam_producer_codes.json"
+
+
+# ── 人员代码表 ────────────────────────────────────────────────
+def load_producer_codes() -> dict:
+    """载入人员代码表，格式: {"KS": "张三", "57": "李四"}"""
+    if os.path.exists(PRODUCER_CODE_FILE):
+        try:
+            with open(PRODUCER_CODE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+
+def save_producer_codes(codes: dict):
+    with open(PRODUCER_CODE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(codes, f, ensure_ascii=False, indent=2)
+
+
+def parse_producer_from_filename(filename: str, code_map: dict) -> str:
+    """
+    从文件名解析制作人。
+    格式规则： YYYYMMDD-CODE-描述
+      - 第一段必须是 8 位数字（日期）
+      - 第二段必须是纯字母或纯数字，长度 1~6 位
+    识别到 CODE 后查 code_map 映射到真实姓名；查不到映射则直接返回 CODE。
+    识别不到 CODE 返回 '未知'.
+    """
+    import re
+    name = os.path.splitext(os.path.basename(filename))[0]
+    # 去掉尾部空格+(N)
+    name = re.sub(r'\s*\(\d+\)\s*$', '', name).strip()
+    parts = name.split('-')
+    if len(parts) < 2:
+        return '未知'
+    if not re.match(r'^\d{8}$', parts[0].strip()):
+        return '未知'
+    code = parts[1].strip()
+    if not re.match(r'^[A-Za-z0-9]{1,6}$', code):
+        return '未知'
+    # CODE 查对照表（大小写不敏感）
+    for k, v in code_map.items():
+        if k.upper() == code.upper():
+            return v
+    return code  # 有 CODE 但对照表中没有，直接用 CODE
 
 
 def load_config():
