@@ -84,7 +84,7 @@ class DropArea(QFrame):
         self.multi  = multi
         self._files = []
         self.setAcceptDrops(True)
-        self.setMinimumHeight(148)
+        self.setMinimumHeight(100)
         self.setStyleSheet(
             "DropArea{border:2px dashed #3498db;border-radius:8px;background:#f8f9fa;}"
         )
@@ -125,18 +125,26 @@ class DropArea(QFrame):
         if not self._files:
             ph = QLabel("拖入文件或文件夹…"); ph.setStyleSheet("color:#aaa;font-size:12px;")
             self._pv.addWidget(ph); return
-        for fp in self._files[:30]:
-            box = QWidget(); bv = QVBoxLayout(box); bv.setContentsMargins(2,2,2,2)
-            lbl = QLabel(); lbl.setFixedSize(68, 68); lbl.setScaledContents(True)
-            lbl.setStyleSheet("border:1px solid #ccc;background:#000;")
+        for fp in self._files[:60]:
+            box = QWidget(); bv = QVBoxLayout(box)
+            bv.setContentsMargins(2, 2, 2, 2); bv.setSpacing(2)
+            lbl = QLabel(); lbl.setFixedSize(70, 70)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("border:1px solid #ccc;background:#111;border-radius:3px;")
             th = get_thumbnail(fp)
             if th is not None:
-                rgb = cv2.cvtColor(th, cv2.COLOR_BGR2RGB); h, w, ch = rgb.shape
-                qi  = QImage(rgb.data, w, h, ch*w, QImage.Format.Format_RGB888)
-                lbl.setPixmap(QPixmap.fromImage(qi))
+                rgb = cv2.cvtColor(th, cv2.COLOR_BGR2RGB); h, w_img, ch = rgb.shape
+                qi  = QImage(rgb.data, w_img, h, ch * w_img, QImage.Format.Format_RGB888)
+                pm  = QPixmap.fromImage(qi).scaled(
+                    68, 68,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                lbl.setPixmap(pm)
             else:
                 lbl.setText("?")
-            nm = QLabel(os.path.basename(fp)[:9]); nm.setStyleSheet("font-size:9px;")
+            nm = QLabel(os.path.basename(fp)[:11])
+            nm.setStyleSheet("font-size:9px;color:#555;")
             nm.setAlignment(Qt.AlignmentFlag.AlignCenter)
             bv.addWidget(lbl); bv.addWidget(nm); self._pv.addWidget(box)
 
@@ -389,38 +397,58 @@ class MamApp(QMainWindow):
         btn2 = QPushButton("🔄 刷新列表"); btn2.clicked.connect(self._refresh_canva); v.addWidget(btn2)
         return w
 
-    # ── Tab5：溯源查询 ──────────────────────────────────
+    # ── Tab5：源迹查询 ──────────────────────────────────────────────
     def _tab_query(self):
-        w = QWidget(); v = QVBoxLayout(w)
-        v.addWidget(QLabel("拖入任意文件（含从社交平台下载的），查看完整素材家谱 / 作者 / 层级关系"))
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(6, 4, 6, 4)
         sp = QSplitter(Qt.Orientation.Horizontal)
+        # ── 左侧控制区
         left = QWidget(); lv = QVBoxLayout(left)
-        self._drop_query = DropArea("拖入待查询文件"); lv.addWidget(self._drop_query)
-        btn = QPushButton("🔍  查询溯源（文件）")
-        btn.setStyleSheet("background:#8e44ad;color:#fff;height:40px;font-size:14px;")
+        lv.setContentsMargins(4, 4, 4, 4); lv.setSpacing(5)
+        self._drop_query = DropArea("拖入文件（支持多个）", multi=True)
+        lv.addWidget(self._drop_query)
+        btn = QPushButton("🔍  批量查询源迹")
+        btn.setStyleSheet("background:#8e44ad;color:#fff;height:36px;font-size:13px;")
         btn.clicked.connect(self._do_query); lv.addWidget(btn)
-        sep = QLabel("── 或按 Canva 模板ID 查询 ──")
-        sep.setStyleSheet("color:#888;font-size:11px;margin-top:6px;")
+        sep = QLabel("── Canva 模板ID 查询 ──")
+        sep.setStyleSheet("color:#888;font-size:11px;margin-top:4px;")
         lv.addWidget(sep)
         canva_row = QHBoxLayout()
         self._canva_id_search = QLineEdit()
-        self._canva_id_search.setPlaceholderText("输入Canva模板ID，例：20260313214500000")
-        btn_cv = QPushButton("🎨 查询模板")
-        btn_cv.setStyleSheet("background:#c0392b;color:#fff;")
+        self._canva_id_search.setPlaceholderText("输入Canva模板ID…")
+        btn_cv = QPushButton("🎨")
+        btn_cv.setFixedWidth(34); btn_cv.setStyleSheet("background:#c0392b;color:#fff;")
         btn_cv.clicked.connect(self._do_query_canva)
         canva_row.addWidget(self._canva_id_search); canva_row.addWidget(btn_cv)
         lv.addLayout(canva_row)
+        btn_copy_all = QPushButton("📋  全部复制（Google Sheets）")
+        btn_copy_all.setStyleSheet(
+            "background:#27ae60;color:#fff;height:32px;font-size:12px;")
+        btn_copy_all.clicked.connect(self._copy_all_lineage); lv.addWidget(btn_copy_all)
+        btn_clr = QPushButton("🗑  清空结果")
+        btn_clr.setStyleSheet("height:28px;font-size:12px;")
+        btn_clr.clicked.connect(self._clear_query_results); lv.addWidget(btn_clr)
+        lv.addStretch()
         sp.addWidget(left)
-        right = QWidget(); rv = QVBoxLayout(right)
-        rv.addWidget(QLabel("📋  溯源家谱（展开查看完整层级）："))
-        self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["素材 / 关系", "制作人", "时间", "类型", "phash前16位"])
-        self._tree.setColumnWidth(0, 300); self._tree.setColumnWidth(1, 100)
-        self._tree.setColumnWidth(2, 150); self._tree.setColumnWidth(3, 70)
-        self._tree.setAlternatingRowColors(True); rv.addWidget(self._tree)
-        sp.addWidget(right); sp.setSizes([360, 760]); v.addWidget(sp)
+        # ── 右侧结果区（滚动卡片）
+        self._query_scroll = QScrollArea()
+        self._query_scroll.setWidgetResizable(True)
+        self._query_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._query_result_box = QWidget()
+        self._query_result_lay = QVBoxLayout(self._query_result_box)
+        self._query_result_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._query_result_lay.setSpacing(6)
+        self._query_placeholder = QLabel(
+            "← 拖入文件后点击查询，每个文件的源迹结果将在此展示"
+        )
+        self._query_placeholder.setStyleSheet(
+            "color:#aaa;font-size:13px;padding:30px;")
+        self._query_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._query_result_lay.addWidget(self._query_placeholder)
+        self._query_scroll.setWidget(self._query_result_box)
+        sp.addWidget(self._query_scroll)
+        sp.setSizes([270, 890]); v.addWidget(sp)
+        self._lineage_results = []
         return w
-
     # ── Tab6：全量库 ────────────────────────────────────
     def _tab_library(self):
         w = QWidget(); v = QVBoxLayout(w)
@@ -571,6 +599,170 @@ class MamApp(QMainWindow):
             QApplication.clipboard().setText(f"【{self._last_canva_id}】")
             self._log(f"\u2705 已复制到剪切板：【{self._last_canva_id}】")
 
+    # ────────────────────────────────────────────────────────────
+    # 源迹查询律 — 卡片构建 & 复制
+    # ────────────────────────────────────────────────────────────
+    def _build_result_card(self, fp, img, lineage) -> QFrame:
+        """\u4e3a单个文件构建源迹结果卡片：缩略图(1:1比例) + 家谱树 + 复制按钮"""
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame{border:1px solid #d5d8dc;border-radius:8px;"
+            "background:#fff;margin:1px;}")
+        row_lay = QHBoxLayout(card); row_lay.setContentsMargins(8, 8, 8, 8); row_lay.setSpacing(8)
+        # 缩略图（保持原始比例）
+        lbl_th = QLabel(); lbl_th.setFixedSize(88, 88)
+        lbl_th.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_th.setStyleSheet("border:1px solid #bbb;background:#111;border-radius:4px;")
+        if img is not None:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB); h, w_img, ch = rgb.shape
+            qi  = QImage(rgb.data, w_img, h, ch * w_img, QImage.Format.Format_RGB888)
+            pm  = QPixmap.fromImage(qi).scaled(
+                86, 86, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            lbl_th.setPixmap(pm)
+        else:
+            lbl_th.setText("?"); lbl_th.setStyleSheet("color:#aaa;font-size:22px;")
+        row_lay.addWidget(lbl_th)
+        # 右侧信息区
+        rw = QWidget(); rv2 = QVBoxLayout(rw)
+        rv2.setContentsMargins(0, 0, 0, 0); rv2.setSpacing(4)
+        hdr = QHBoxLayout(); hdr.setSpacing(6)
+        lbl_fn = QLabel(os.path.basename(fp))
+        lbl_fn.setStyleSheet("font-weight:bold;font-size:12px;color:#2c3e50;")
+        hdr.addWidget(lbl_fn)
+        if lineage:
+            ast_d = lineage['asset']
+            lbl_meta = QLabel(
+                f"  {(ast_d.get('phash','') or '')[:16]}…"
+                f"  \U0001f464{ast_d.get('producer','?')}"
+                f"  \U0001f4c5{str(ast_d.get('created_at',''))[:10]}"
+            )
+            lbl_meta.setStyleSheet("font-size:11px;color:#7f8c8d;")
+            hdr.addWidget(lbl_meta)
+        hdr.addStretch()
+        btn_cp = QPushButton("📋 复制此行")
+        btn_cp.setFixedWidth(76); btn_cp.setFixedHeight(22)
+        btn_cp.setStyleSheet("font-size:10px;background:#ecf0f1;border:1px solid #bdc3c7;")
+        btn_cp.clicked.connect(lambda _, f=fp, lg=lineage: self._copy_lineage_row(f, lg))
+        hdr.addWidget(btn_cp)
+        rv2.addLayout(hdr)
+        if not lineage:
+            miss = QLabel("❓ 该文件未在数据库登记，无源迹信息")
+            miss.setStyleSheet("color:#e74c3c;font-size:11px;padding:2px;")
+            rv2.addWidget(miss)
+        else:
+            tree = QTreeWidget()
+            tree.setHeaderLabels(["素材 / 关系", "制作人", "时间", "类型"])
+            tree.setColumnWidth(0, 260); tree.setColumnWidth(1, 80)
+            tree.setColumnWidth(2, 130); tree.setColumnWidth(3, 60)
+            tree.setAlternatingRowColors(True)
+            tree.setMinimumHeight(60); tree.setMaximumHeight(220)
+            self._fill_lineage_tree(tree, lineage)
+            rv2.addWidget(tree)
+        row_lay.addWidget(rw, 1)
+        return card
+
+    def _fill_lineage_tree(self, tree: QTreeWidget, lineage: dict):
+        """\u5c06 lineage dict \u586b\u5145\u5230\u6307\u5b9a QTreeWidget"""
+        tree.clear()
+        ast_d = lineage['asset']
+        root = QTreeWidgetItem([
+            f"\U0001f3af {ast_d.get('filename','?')}",
+            ast_d.get('producer', '?'),
+            str(ast_d.get('created_at', ''))[:16],
+            ast_d.get('asset_type', '?'),
+        ])
+        ff = QFont(); ff.setBold(True); root.setFont(0, ff)
+        root.setForeground(0, QColor("#2c3e50"))
+        if lineage.get('derived_from'):
+            sec = QTreeWidgetItem(["⬆ 衍生来源（多级）"])
+            sec.setForeground(0, QColor("#e67e22"))
+            for r in lineage['derived_from']:
+                sec.addChild(self._make_ancestor_item(r))
+            root.addChild(sec); sec.setExpanded(True)
+        if lineage.get('derived_to'):
+            sec = QTreeWidgetItem(["⬇ 衍生出（多级）"])
+            sec.setForeground(0, QColor("#27ae60"))
+            for r in lineage['derived_to']:
+                sec.addChild(self._make_descendant_item(r))
+            root.addChild(sec); sec.setExpanded(True)
+        if lineage.get('composed_from'):
+            sec = QTreeWidgetItem(["📦 组件来源"])
+            sec.setForeground(0, QColor("#8e44ad"))
+            for r in lineage['composed_from']:
+                sec.addChild(self._make_component_item(r))
+            root.addChild(sec); sec.setExpanded(True)
+        if lineage.get('used_in'):
+            sec = QTreeWidgetItem(["🎦 被用于成品"])
+            sec.setForeground(0, QColor("#2980b9"))
+            for r in lineage['used_in']:
+                child = QTreeWidgetItem([
+                    f"  \U0001f4c4 {r.get('filename','?')}",
+                    r.get('producer','?'),
+                    str(r.get('created_at',''))[:16],
+                    r.get('asset_type','?'),
+                ])
+                sec.addChild(child)
+            root.addChild(sec); sec.setExpanded(True)
+        if lineage.get('canva_used'):
+            sec = QTreeWidgetItem([f"\U0001f3a8 Canva\u6a21\u677f ({len(lineage['canva_used'])}\u4e2a)"])
+            sec.setForeground(0, QColor("#c0392b"))
+            for t in lineage['canva_used']:
+                child = QTreeWidgetItem([
+                    f"  \U0001f3a8 {t.get('template_name','?')}",
+                    t.get('creator','?'), str(t.get('created_at',''))[:16], "canva",
+                ])
+                sec.addChild(child)
+            root.addChild(sec); sec.setExpanded(True)
+        tree.addTopLevelItem(root); root.setExpanded(True)
+
+    def _lineage_to_tsv(self, fp: str, lineage) -> str:
+        """\u8f6c\u6362\u4e3a Google Sheets \u53ef\u76f4\u63a5\u7c98\u8d34\u7684 TSV \u683c\u5f0f\uff08\u542b\u8868\u5934\u65f6\u4e00\u884c\uff09"""
+        fname = os.path.basename(fp)
+        if not lineage:
+            return f"{fname}\t\u672a\u767b\u8bb0\t\t\t\t\t\t"
+        ast_d = lineage['asset']
+        ph    = ast_d.get('phash', '')
+        prod  = ast_d.get('producer', '')
+        date  = str(ast_d.get('created_at', ''))[:10]
+        derived = '; '.join(
+            f"{r.get('filename','?')}({r.get('producer','?')})"
+            for r in lineage.get('derived_from', [])
+        )
+        parts = '; '.join(
+            f"{r.get('filename','?')}({r.get('producer','?')})"
+            for r in lineage.get('composed_from', [])
+        )
+        used = '; '.join(
+            f"{r.get('filename','?')}({r.get('producer','?')})"
+            for r in lineage.get('used_in', [])
+        )
+        canva = '; '.join(
+            f"{t.get('template_id','')}({t.get('template_name','?')})"
+            for t in lineage.get('canva_used', [])
+        )
+        return f"{fname}\t{ph}\t{prod}\t{date}\t{derived}\t{parts}\t{used}\t{canva}"
+
+    def _copy_lineage_row(self, fp: str, lineage):
+        QApplication.clipboard().setText(self._lineage_to_tsv(fp, lineage))
+        self._log(f"\u2705 \u5df2\u590d\u5236: {os.path.basename(fp)}")
+
+    def _copy_all_lineage(self):
+        if not self._lineage_results:
+            QMessageBox.information(self, "\u63d0\u793a", "\u6682\u65e0\u67e5\u8be2\u7ed3\u679c"); return
+        header = "\u6587\u4ef6\u540d\tphash\t\u5236\u4f5c\u4eba\t\u65e5\u671f\t\u884d\u751f\u6765\u6e90\t\u5c01\u88c5\u7ec4\u4ef6\t\u88ab\u7528\u4e8e\tCanva\u6a21\u677f"
+        rows = [self._lineage_to_tsv(r['fp'], r['lineage']) for r in self._lineage_results]
+        QApplication.clipboard().setText(header + '\n' + '\n'.join(rows))
+        self._log(f"\u2705 \u5df2\u590d\u5236 {len(rows)} \u6761\u8bb0\u5f55\uff08\u542b\u8868\u5934\uff09\uff0c\u53ef\u76f4\u63a5\u7c98\u8d34\u5230 Google Sheets")
+
+    def _clear_query_results(self):
+        while self._query_result_lay.count():
+            item = self._query_result_lay.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self._lineage_results = []
+        self._query_result_lay.addWidget(self._query_placeholder)
+        self._query_placeholder.show()
+
     def _make_component_item(self, row) -> QTreeWidgetItem:
         """构建封装组件树节点（递归：含衍生祖先 + 子封装层级）"""
         ph = row.get('part_phash') or row.get('phash', '')
@@ -649,76 +841,29 @@ class MamApp(QMainWindow):
             self._tbl_canva.setItem(idx,3, QTableWidgetItem(str(len(ph_list))))
 
     def _do_query(self):
-        fp = self._drop_query.file()
-        if not fp: QMessageBox.warning(self, "提示", "请先拖入要查询的文件"); return
+        fps = self._drop_query.files()
+        if not fps: QMessageBox.warning(self, "提示", "请先拖入要查询的文件"); return
         def task():
-            img = get_thumbnail(fp)
-            ph, src = get_phash_from_file(fp, img)
-            if not ph: gui_log("❌ 无法计算phash"); return None
-            return db.get_lineage(ph)
-        def done(lineage):
-            self._tree.clear()
-            if not lineage:
-                self._log("❓ 该文件未登记，无溯源信息")
-                self._tree.addTopLevelItem(QTreeWidgetItem(["❓ 未登记"])); return
-            ast = lineage['asset']
-            root = QTreeWidgetItem([
-                f"🎯 {ast.get('filename','?')}",
-                ast.get('producer', '?'),
-                str(ast.get('created_at', ''))[:16],
-                ast.get('asset_type', '?'),
-                (ast.get('phash', '') or '')[:16] + "…"
-            ])
-            ff = QFont(); ff.setBold(True); root.setFont(0, ff)
-            root.setForeground(0, QColor("#2c3e50"))
-            if lineage['derived_from']:
-                sec = QTreeWidgetItem(["⬆ 衍生来源（多级）"])
-                sec.setForeground(0, QColor("#e67e22"))
-                for row in lineage['derived_from']:
-                    sec.addChild(self._make_ancestor_item(row))
-                root.addChild(sec); sec.setExpanded(True)
-            if lineage['derived_to']:
-                sec = QTreeWidgetItem(["⬇ 衍生出（多级）"])
-                sec.setForeground(0, QColor("#27ae60"))
-                for row in lineage['derived_to']:
-                    sec.addChild(self._make_descendant_item(row))
-                root.addChild(sec); sec.setExpanded(True)
-            if lineage['composed_from']:
-                sec = QTreeWidgetItem(["📦 组件来源"])
-                sec.setForeground(0, QColor("#8e44ad"))
-                for row in lineage['composed_from']:
-                    sec.addChild(self._make_component_item(row))
-                root.addChild(sec); sec.setExpanded(True)
-            if lineage['used_in']:
-                sec = QTreeWidgetItem(["🎬 被用于成品"])
-                sec.setForeground(0, QColor("#2980b9"))
-                for row in lineage['used_in']:
-                    child = QTreeWidgetItem([
-                        f"  📄 {row.get('filename','?')}",
-                        row.get('producer', '?'),
-                        str(row.get('created_at', ''))[:16],
-                        row.get('asset_type', '?'),
-                        (row.get('product_phash', '') or '')[:16] + "…"
-                    ])
-                    sec.addChild(child)
-                root.addChild(sec); sec.setExpanded(True)
-            if lineage.get('canva_used'):
-                sec = QTreeWidgetItem([f"🎨 Canva模板 ({len(lineage['canva_used'])}个)"])
-                sec.setForeground(0, QColor("#c0392b"))
-                for tmpl in lineage['canva_used']:
-                    child = QTreeWidgetItem([
-                        f"  🎨 {tmpl.get('template_name','?')}",
-                        tmpl.get('creator', '?'),
-                        str(tmpl.get('created_at', ''))[:16],
-                        "canva模板",
-                        tmpl.get('template_id', '')
-                    ])
-                    sec.addChild(child)
-                root.addChild(sec); sec.setExpanded(True)
-            self._tree.addTopLevelItem(root); root.setExpanded(True)
-            self._log(f"✅ 溯源: {ast.get('filename','?')}")
-        self._bg(task, done, msg="溯源查询")
-
+            results = []
+            for fp in fps:
+                try:
+                    img = get_thumbnail(fp)
+                    ph, _ = get_phash_from_file(fp, img)
+                    lineage = db.get_lineage(ph) if ph else None
+                except Exception as e:
+                    gui_log(f"❌ {os.path.basename(fp)}: {e}")
+                    img, lineage = None, None
+                results.append({'fp': fp, 'img': img, 'lineage': lineage})
+            return results
+        def done(results):
+            if hasattr(self, '_query_placeholder'):
+                self._query_placeholder.hide()
+            self._lineage_results.extend(results)
+            for res in results:
+                card = self._build_result_card(res['fp'], res['img'], res['lineage'])
+                self._query_result_lay.addWidget(card)
+            self._log(f"✅ 源迹查询完成，共 {len(results)} 个文件")
+        self._bg(task, done, msg="源迹查询")
     def _do_query_canva(self):
         tid = self._canva_id_search.text().strip()
         if not tid:
@@ -726,36 +871,54 @@ class MamApp(QMainWindow):
         def task():
             return db.get_lineage_by_canva_id(tid)
         def done(result):
-            self._tree.clear()
             if not result:
                 self._log(f"❓ Canva模板 [{tid}] 未找到"); return
-            tmpl = result['template']
-            root = QTreeWidgetItem([
-                f"🎨 {tmpl.get('template_name','?')}",
-                tmpl.get('creator', '?'),
-                str(tmpl.get('created_at', ''))[:16],
-                "Canva模板",
-                tmpl.get('template_id', '')
-            ])
-            ff = QFont(); ff.setBold(True); root.setFont(0, ff)
-            root.setForeground(0, QColor("#8e44ad"))
+            if hasattr(self, '_query_placeholder'):
+                self._query_placeholder.hide()
+            tmpl    = result['template']
+            tid_val = tmpl.get('template_id', '')
+            tname   = tmpl.get('template_name', '?')
+            tcreator = tmpl.get('creator', '?')
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame{border:2px solid #9b59b6;border-radius:8px;"
+                "background:#fdf8ff;margin:1px;}")
+            cv2_lay = QVBoxLayout(card); cv2_lay.setContentsMargins(8, 8, 8, 8)
+            hdr = QHBoxLayout()
+            lbl = QLabel(f"🎨 {tname}  【{tid_val}】  👤{tcreator}")
+            lbl.setStyleSheet("font-weight:bold;font-size:13px;color:#6c3483;")
+            hdr.addWidget(lbl); hdr.addStretch()
+            def _make_copy_fn(t):
+                def fn():
+                    QApplication.clipboard().setText(f"【{t}】")
+                    self._log(f"✅ 已复制: 【{t}】")
+                return fn
+            btn_cp = QPushButton("📋 复制模板ID")
+            btn_cp.setFixedWidth(90); btn_cp.setFixedHeight(22)
+            btn_cp.setStyleSheet("font-size:10px;background:#ecf0f1;border:1px solid #bdc3c7;")
+            btn_cp.clicked.connect(_make_copy_fn(tid_val))
+            hdr.addWidget(btn_cp); cv2_lay.addLayout(hdr)
+            tree = QTreeWidget()
+            tree.setHeaderLabels(["素材 / 关系", "制作人", "时间", "类型"])
+            tree.setColumnWidth(0, 280); tree.setColumnWidth(1, 80)
+            tree.setColumnWidth(2, 130); tree.setColumnWidth(3, 60)
+            tree.setAlternatingRowColors(True)
+            tree.setMinimumHeight(80); tree.setMaximumHeight(300)
             for asset in result['assets']:
-                a_item = QTreeWidgetItem([
-                    f"  🖼 {asset.get('filename','?')}",
-                    asset.get('producer', '?'),
-                    str(asset.get('created_at', ''))[:16],
-                    asset.get('asset_type', '?'),
-                    (asset.get('phash', '') or '')[:16] + "…"
-                ])
+                fname_a  = asset.get('filename', '?')
+                prod_a   = asset.get('producer', '?')
+                date_a   = str(asset.get('created_at', ''))[:16]
+                atype_a  = asset.get('asset_type', '?')
+                a_item = QTreeWidgetItem([f"  🖼 {fname_a}", prod_a, date_a, atype_a])
                 a_item.setForeground(0, QColor("#2c3e50"))
                 for anc in asset.get('ancestors', []):
                     a_item.addChild(self._make_ancestor_item(anc))
-                root.addChild(a_item)
-            self._tree.addTopLevelItem(root); root.setExpanded(True)
-            for i in range(root.childCount()): root.child(i).setExpanded(True)
-            self._log(f"✅ 模板溯源: {tmpl.get('template_name','?')}  素材{len(result['assets'])}个")
-        self._bg(task, done, msg="Canva模板溯源")
-
+                a_item.setExpanded(True)
+                tree.addTopLevelItem(a_item)
+            cv2_lay.addWidget(tree)
+            self._query_result_lay.addWidget(card)
+            self._log(f"✅ 模板源迹: {tname}  素材{len(result['assets'])}个")
+        self._bg(task, done, msg="Canva模板源迹")
     def _refresh_lib(self):
         self._lib_data = db.get_all_assets(); self._fill_lib(self._lib_data)
 
