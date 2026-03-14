@@ -125,7 +125,17 @@ class DBManager:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
 
-            # ── 统一关系表 collation，消除 JOIN 时「Illegal mix of collations」错误 ──
+            # ── 人员代码表 ──────────────────────────────
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS producer_codes (
+                    code        VARCHAR(20)  NOT NULL PRIMARY KEY,
+                    name        VARCHAR(100) NOT NULL,
+                    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+                                           ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+
+            # ── 统一关系表 collation，消除 JOIN 时『Illegal mix of collations』错误 ──
             cur.execute("""
                 SELECT TABLE_COLLATION FROM information_schema.TABLES
                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'assets'
@@ -469,3 +479,30 @@ class DBManager:
         with self.conn.cursor() as cur:
             cur.execute("SELECT phash FROM assets")
             return {r['phash'] for r in cur.fetchall()}
+
+    # ── 人员代码 CRUD ────────────────────────────────────────────────────────
+    def get_producer_codes(self) -> dict:
+        """返回 {code: name} 字典"""
+        if not self.conn:
+            return {}
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT code, name FROM producer_codes ORDER BY code")
+            return {r['code']: r['name'] for r in cur.fetchall()}
+
+    def upsert_producer_code(self, code: str, name: str):
+        if not self.conn:
+            return
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO producer_codes (code, name) VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE name = VALUES(name)
+            """, (code.upper().strip(), name.strip()))
+        self.conn.commit()
+
+    def delete_producer_code(self, code: str):
+        if not self.conn:
+            return
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM producer_codes WHERE code = %s",
+                        (code.upper().strip(),))
+        self.conn.commit()

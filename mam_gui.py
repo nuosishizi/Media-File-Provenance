@@ -437,6 +437,19 @@ class MamApp(QMainWindow):
         self._query_result_lay = QVBoxLayout(self._query_result_box)
         self._query_result_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._query_result_lay.setSpacing(6)
+        # 全局列标题行（只展示一次，不随卡片清空）
+        self._query_hdr_row = QWidget()
+        self._query_hdr_row.setStyleSheet(
+            "background:#eef0f5;border-bottom:1px solid #c5c8d0;")
+        _hlay = QHBoxLayout(self._query_hdr_row)
+        _hlay.setContentsMargins(107, 3, 20, 3); _hlay.setSpacing(0)
+        for _cn, _cw in [("\u7d20\u6750 / \u5173\u7cfb", 258), ("\u5236\u4f5c\u4eba", 78),
+                         ("\u65f6\u95f4", 128), ("\u7c7b\u578b", 58)]:
+            _lb = QLabel(_cn); _lb.setFixedWidth(_cw)
+            _lb.setStyleSheet("font-size:11px;color:#445;font-weight:bold;")
+            _hlay.addWidget(_lb)
+        _hlay.addStretch()
+        self._query_result_lay.addWidget(self._query_hdr_row)
         self._query_placeholder = QLabel(
             "← 拖入文件后点击查询，每个文件的源迹结果将在此展示"
         )
@@ -652,11 +665,12 @@ class MamApp(QMainWindow):
             rv2.addWidget(miss)
         else:
             tree = QTreeWidget()
-            tree.setHeaderLabels(["素材 / 关系", "制作人", "时间", "类型"])
+            tree = QTreeWidget()
+            tree.setHeaderHidden(True)
+            tree.setColumnCount(4)
             tree.setColumnWidth(0, 260); tree.setColumnWidth(1, 80)
             tree.setColumnWidth(2, 130); tree.setColumnWidth(3, 60)
             tree.setAlternatingRowColors(True)
-            tree.setMinimumHeight(60); tree.setMaximumHeight(220)
             self._fill_lineage_tree(tree, lineage)
             rv2.addWidget(tree)
         row_lay.addWidget(rw, 1)
@@ -756,11 +770,18 @@ class MamApp(QMainWindow):
         self._log(f"\u2705 \u5df2\u590d\u5236 {len(rows)} \u6761\u8bb0\u5f55\uff08\u542b\u8868\u5934\uff09\uff0c\u53ef\u76f4\u63a5\u7c98\u8d34\u5230 Google Sheets")
 
     def _clear_query_results(self):
-        while self._query_result_lay.count():
-            item = self._query_result_lay.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
+        protected = {self._query_placeholder, self._query_hdr_row}
+        i = 0
+        while i < self._query_result_lay.count():
+            item = self._query_result_lay.itemAt(i)
+            w = item.widget() if item else None
+            if w in protected:
+                i += 1
+                continue
+            self._query_result_lay.takeAt(i)
+            if w:
+                w.deleteLater()
         self._lineage_results = []
-        self._query_result_lay.addWidget(self._query_placeholder)
         self._query_placeholder.show()
 
     def _make_component_item(self, row) -> QTreeWidgetItem:
@@ -987,6 +1008,7 @@ class MamApp(QMainWindow):
         self._code_table.setMaximumHeight(160)
         self._code_table.setAlternatingRowColors(True)
         cv.addWidget(self._code_table)
+        self._code_table.itemChanged.connect(self._on_code_table_changed)
 
         # 添加行
         add_row = QHBoxLayout()
@@ -1070,13 +1092,18 @@ class MamApp(QMainWindow):
             self._scan_path.setText(d)
 
     def _load_code_table(self):
-        """从文件加载人员代码表并填充到 QTableWidget"""
-        codes = load_producer_codes()
+        """从数据库加载人员代码表，若 DB 为空则自动从 JSON 迁移"""
+        codes = db.get_producer_codes()
+        if not codes:
+            codes = load_producer_codes()  # JSON 备用/迁移
+            for c, n in codes.items():
+                db.upsert_producer_code(c, n)
         self._code_table.setRowCount(0)
         for code, name in codes.items():
             self._insert_code_row(code, name)
 
     def _insert_code_row(self, code, name):
+        self._code_table.blockSignals(True)
         idx = self._code_table.rowCount()
         self._code_table.insertRow(idx)
         self._code_table.setItem(idx, 0, QTableWidgetItem(code))
@@ -1085,12 +1112,15 @@ class MamApp(QMainWindow):
         btn_del.setFixedWidth(32)
         btn_del.clicked.connect(lambda _, r=idx: self._del_code_row(r))
         self._code_table.setCellWidget(idx, 2, btn_del)
+        self._code_table.blockSignals(False)
 
     def _del_code_row(self, row):
-        # 按钮绑定的行号可能因删除偏移，重新找
         btn = self.sender()
         for r in range(self._code_table.rowCount()):
             if self._code_table.cellWidget(r, 2) is btn:
+                code_item = self._code_table.item(r, 0)
+                if code_item and code_item.text().strip():
+                    db.delete_producer_code(code_item.text())
                 self._code_table.removeRow(r); break
 
     def _add_producer_code(self):
@@ -1098,15 +1128,17 @@ class MamApp(QMainWindow):
         name = self._name_input.text().strip()
         if not code or not name:
             QMessageBox.warning(self, "提示", "CODE 和姓名不能为空"); return
-        # 检查是否已存在
+        db.upsert_producer_code(code, name)
         for r in range(self._code_table.rowCount()):
-            if self._code_table.item(r, 0) and \
-               self._code_table.item(r, 0).text().upper() == code:
+            if self._code_table.item(r, 0) and                self._code_table.item(r, 0).text().upper() == code:
+                self._code_table.blockSignals(True)
                 self._code_table.item(r, 1).setText(name)
+                self._code_table.blockSignals(False)
                 self._code_input.clear(); self._name_input.clear()
-                return
+                self._log(f"✅ 已更新: {code} → {name}"); return
         self._insert_code_row(code, name)
         self._code_input.clear(); self._name_input.clear()
+        self._log(f"✅ 已添加: {code} → {name}")
 
     def _save_producer_codes(self):
         codes = {}
@@ -1115,8 +1147,24 @@ class MamApp(QMainWindow):
             v = self._code_table.item(r, 1)
             if k and v and k.text().strip():
                 codes[k.text().strip().upper()] = v.text().strip()
-        save_producer_codes(codes)
-        self._log(f"✅ 人员代码表已保存，共 {len(codes)} 条")
+        if db.conn:
+            with db.conn.cursor() as cur:
+                cur.execute("DELETE FROM producer_codes")
+            db.conn.commit()
+            for code, name in codes.items():
+                db.upsert_producer_code(code, name)
+        save_producer_codes(codes)  # JSON 备份
+        self._log(f"✅ 已保存 {len(codes)} 条人员代码到数据库")
+
+    def _on_code_table_changed(self, item):
+        """表格内容变化时自动保存到 DB"""
+        if item.column() not in (0, 1):
+            return
+        code_item = self._code_table.item(item.row(), 0)
+        name_item = self._code_table.item(item.row(), 1)
+        if code_item and name_item and                 code_item.text().strip() and name_item.text().strip():
+            db.upsert_producer_code(code_item.text().strip(),
+                                    name_item.text().strip())
 
     def _get_code_map(self) -> dict:
         """从当前表格读取 code_map（不依赖磁盘文件，实时生效）"""
