@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTabWidget, QTableWidget, QTableWidgetItem,
     QMessageBox, QFormLayout, QFrame, QTextEdit, QHeaderView, QScrollArea,
     QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QSplitter, QComboBox,
-    QFileDialog, QProgressBar
+    QFileDialog, QProgressBar, QStackedWidget
 )
 from PyQt6.QtCore  import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui   import QPixmap, QImage, QColor, QFont
@@ -86,7 +86,7 @@ class DropArea(QFrame):
         self.setAcceptDrops(True)
         self.setMinimumHeight(100)
         self.setStyleSheet(
-            "DropArea{border:2px dashed #3498db;border-radius:8px;background:#f8f9fa;}"
+            "DropArea{border:2px dashed #c7c7cc;border-radius:10px;background:#fafafa;}"
         )
         lay = QVBoxLayout(self)
         hdr = QHBoxLayout()
@@ -297,32 +297,41 @@ class MamApp(QMainWindow):
     # ═══════════════════ UI 构建 ═══════════════════════
     def _build_ui(self):
         root = QWidget(); self.setCentralWidget(root)
-        vbox = QVBoxLayout(root); vbox.setContentsMargins(6,6,6,4)
+        vbox = QVBoxLayout(root)
+        vbox.setContentsMargins(0, 0, 0, 0); vbox.setSpacing(0)
 
-        # 顶栏
-        top = QHBoxLayout()
-        self._lbl_user = QLabel(f"👤  操作员：{self._cfg['user_name']}")
-        self._lbl_user.setStyleSheet("font-size:14px;font-weight:bold;")
-        top.addWidget(self._lbl_user); top.addStretch()
-        btn_cfg = QPushButton("⚙️  系统设置"); btn_cfg.clicked.connect(self._dlg_settings)
-        top.addWidget(btn_cfg); vbox.addLayout(top)
+        # ── 顶栏
+        hdr = QWidget()
+        hdr.setStyleSheet("background:#ffffff;border-bottom:1px solid #e5e5ea;")
+        tl = QHBoxLayout(hdr); tl.setContentsMargins(16, 8, 16, 8)
+        self._lbl_user = QLabel(f"  {self._cfg['user_name']}")
+        self._lbl_user.setStyleSheet(
+            "font-size:14px;font-weight:600;color:#1d1d1f;")
+        tl.addWidget(self._lbl_user); tl.addStretch()
+        btn_cfg = QPushButton("⚙  设置")
+        btn_cfg.setStyleSheet(
+            "background:transparent;border:none;color:#007aff;"
+            "font-size:13px;padding:4px 10px;border-radius:6px;")
+        btn_cfg.clicked.connect(self._dlg_settings)
+        tl.addWidget(btn_cfg); vbox.addWidget(hdr)
 
         tabs = QTabWidget()
-        tabs.addTab(self._tab_register(),  "  素材登记  ")
-        tabs.addTab(self._tab_derive(),    "  处理关联  ")
-        tabs.addTab(self._tab_compose(),   "  成品封装  ")
-        tabs.addTab(self._tab_canva(),     "  Canva模板 ")
-        tabs.addTab(self._tab_query(),     "  溯源查询  ")
-        tabs.addTab(self._tab_library(),   "  全量库    ")
+        tabs.addTab(self._tab_register(),    "  登记  ")
+        tabs.addTab(self._tab_derive(),      "  处理 & 封装  ")
+        tabs.addTab(self._tab_canva(),       "  Canva  ")
+        tabs.addTab(self._tab_query(),       "  溯源查询  ")
+        tabs.addTab(self._tab_library(),     "  全量库  ")
         tabs.addTab(self._tab_batch_scan(),  "  批量扫描  ")
         vbox.addWidget(tabs)
 
         self._log_box = QTextEdit(); self._log_box.setReadOnly(True)
-        self._log_box.setMaximumHeight(110)
-        self._log_box.setStyleSheet("background:#1a1a2e;color:#00d4ff;font-size:12px;")
+        self._log_box.setMaximumHeight(88)
+        self._log_box.setObjectName("logbox")
+        self._log_box.setStyleSheet(
+            "QTextEdit#logbox{"
+            "background:#1c1c1e;color:#30d158;"
+            "font-family:Consolas,Menlo,monospace;font-size:11px;border:none;}")
         vbox.addWidget(self._log_box)
-
-    # ── Tab1：素材登记 ──────────────────────────────────
     def _tab_register(self):
         w = QWidget(); v = QVBoxLayout(w)
         v.addWidget(QLabel("拖入原始素材，系统自动计算 phash 并写入文件元数据（备注字段）和数据库"))
@@ -334,36 +343,130 @@ class MamApp(QMainWindow):
 
     # ── Tab2：处理关联 ──────────────────────────────────
     def _tab_derive(self):
+        """处理关联 & 成品封装合并面板"""
         w = QWidget(); v = QVBoxLayout(w)
-        v.addWidget(QLabel("用于：原素材经修改/转格式后，建立来源追踪。例：原图→修图、图→视频"))
-        grp = QHBoxLayout()
-        self._drop_src = DropArea("① 来源素材（原始）")
-        self._drop_dst = DropArea("② 衍生素材（修改后）")
-        grp.addWidget(self._drop_src); grp.addWidget(self._drop_dst); v.addLayout(grp)
-        row = QHBoxLayout(); row.addWidget(QLabel("关系类型："))
-        self._cmb_rel = QComboBox()
-        self._cmb_rel.addItems(["image_to_image（修图）","image_to_video（生视频）",
-                                  "video_to_video（视频剪辑）","其他"])
-        row.addWidget(self._cmb_rel); row.addStretch(); v.addLayout(row)
-        btn = QPushButton("🔗  建立衍生关联")
-        btn.setStyleSheet("background:#e67e22;color:#fff;height:40px;font-size:14px;")
-        btn.clicked.connect(self._do_derive); v.addWidget(btn)
-        return w
+        v.setContentsMargins(14, 10, 14, 10); v.setSpacing(10)
 
-    # ── Tab3：成品封装 ──────────────────────────────────
+        # ── 仿苹果 Segmented Control ──
+        seg_bg = QWidget()
+        seg_bg.setStyleSheet(
+            "QWidget{background:#f2f2f7;border-radius:9px;padding:2px;}")
+        sl = QHBoxLayout(seg_bg)
+        sl.setSpacing(2); sl.setContentsMargins(4, 4, 4, 4)
+        self._btn_rel_derive  = QPushButton("  衍生关联  ")
+        self._btn_rel_compose = QPushButton("  成品封装  ")
+        _seg_style = (
+            "QPushButton{"
+            "background:transparent;border:none;border-radius:7px;"
+            "font-size:12px;padding:0 14px;color:#6e6e73;min-height:26px;}"
+            "QPushButton:checked{"
+            "background:#ffffff;color:#1d1d1f;font-weight:600;"
+            "border:1px solid #d1d1d6;}"
+        )
+        self._btn_rel_derive.setCheckable(True)
+        self._btn_rel_compose.setCheckable(True)
+        self._btn_rel_derive.setStyleSheet(_seg_style)
+        self._btn_rel_compose.setStyleSheet(_seg_style)
+        self._btn_rel_derive.setChecked(True)
+        self._btn_rel_derive.clicked.connect(lambda: self._switch_relate(0))
+        self._btn_rel_compose.clicked.connect(lambda: self._switch_relate(1))
+        sl.addStretch()
+        sl.addWidget(self._btn_rel_derive)
+        sl.addWidget(self._btn_rel_compose)
+        sl.addStretch()
+        v.addWidget(seg_bg)
+
+        # ── 堆叠页面 ──
+        self._relate_stack = QStackedWidget()
+
+        # 页 0：衍生关联
+        p0 = QWidget(); pv0 = QVBoxLayout(p0)
+        pv0.setContentsMargins(0, 4, 0, 0); pv0.setSpacing(8)
+        lb0 = QLabel(
+            "将原始素材拖入左侧，处理后的文件拖到右侧。"
+            "关系类型根据文件格式自动识别，无需手动选择。")
+        lb0.setStyleSheet("color:#6e6e73;font-size:12px;")
+        lb0.setWordWrap(True); pv0.addWidget(lb0)
+        dr0 = QHBoxLayout(); dr0.setSpacing(10)
+        self._drop_src = DropArea("来源 / 原始素材")
+        self._drop_dst = DropArea("衍生 / 处理后素材")
+        dr0.addWidget(self._drop_src); dr0.addWidget(self._drop_dst)
+        pv0.addLayout(dr0)
+        self._lbl_rel_type = QLabel("关系类型：拖入两侧文件后自动识别")
+        self._lbl_rel_type.setStyleSheet(
+            "color:#6e6e73;font-size:11px;padding:2px 0;")
+        self._drop_src.filesChanged.connect(self._update_rel_type_label)
+        self._drop_dst.filesChanged.connect(self._update_rel_type_label)
+        pv0.addWidget(self._lbl_rel_type)
+        btn0 = QPushButton("🔗  建立衍生关联")
+        btn0.setStyleSheet(
+            "background:#e67e22;color:#fff;border:none;border-radius:9px;"
+            "height:40px;font-size:13px;font-weight:600;")
+        btn0.clicked.connect(self._do_derive)
+        pv0.addWidget(btn0); pv0.addStretch()
+        self._relate_stack.addWidget(p0)
+
+        # 页 1：成品封装
+        p1 = QWidget(); pv1 = QVBoxLayout(p1)
+        pv1.setContentsMargins(0, 4, 0, 0); pv1.setSpacing(8)
+        lb1 = QLabel(
+            "将所有组件素材拖入左侧，最终成品拖到右侧。"
+            "系统自动记录所有来源文件的完整组合关系。")
+        lb1.setStyleSheet("color:#6e6e73;font-size:12px;")
+        lb1.setWordWrap(True); pv1.addWidget(lb1)
+        dr1 = QHBoxLayout(); dr1.setSpacing(10)
+        self._drop_parts   = DropArea("组件素材（可多个）", multi=True)
+        self._drop_product = DropArea("最终成品文件")
+        dr1.addWidget(self._drop_parts); dr1.addWidget(self._drop_product)
+        pv1.addLayout(dr1)
+        btn1 = QPushButton("🔒  封装成品")
+        btn1.setStyleSheet(
+            "background:#27ae60;color:#fff;border:none;border-radius:9px;"
+            "height:40px;font-size:13px;font-weight:600;")
+        btn1.clicked.connect(self._do_compose)
+        pv1.addWidget(btn1); pv1.addStretch()
+        self._relate_stack.addWidget(p1)
+
+        v.addWidget(self._relate_stack)
+        return w
     def _tab_compose(self):
-        w = QWidget(); v = QVBoxLayout(w)
-        v.addWidget(QLabel("用于：多素材合并为一个成品，记录所有组件的来源和作者"))
-        grp = QHBoxLayout()
-        self._drop_parts   = DropArea("① 组件素材（可多个）", multi=True)
-        self._drop_product = DropArea("② 最终成品")
-        grp.addWidget(self._drop_parts); grp.addWidget(self._drop_product); v.addLayout(grp)
-        btn = QPushButton("🔒  封装成品")
-        btn.setStyleSheet("background:#27ae60;color:#fff;height:40px;font-size:14px;")
-        btn.clicked.connect(self._do_compose); v.addWidget(btn)
-        return w
+        """已合并到 _tab_derive，此方法保留备用"""
+        return QWidget()
 
-    # ── Tab4：Canva 模板 ────────────────────────────────
+    def _switch_relate(self, idx: int):
+        """切换衍生关联 / 成品封装页面"""
+        self._relate_stack.setCurrentIndex(idx)
+        self._btn_rel_derive.setChecked(idx == 0)
+        self._btn_rel_compose.setChecked(idx == 1)
+
+    def _update_rel_type_label(self, *_):
+        """拖入文件后自动刷新关系类型标签"""
+        src = self._drop_src.file(); dst = self._drop_dst.file()
+        if src and dst:
+            rel = self._detect_rel_type(src, dst)
+            labels = {
+                "image_to_image": "图片 → 图片（修图）",
+                "image_to_video": "图片 → 视频（生视频）",
+                "video_to_video": "视频 → 视频（视频剪辑）",
+            }
+            self._lbl_rel_type.setText(
+                f"✅ 自动检测：{labels.get(rel, rel)}")
+            self._lbl_rel_type.setStyleSheet(
+                "color:#007aff;font-size:11px;"
+                "font-weight:bold;padding:2px 0;")
+        else:
+            self._lbl_rel_type.setText("关系类型：拖入两侧文件后自动识别")
+            self._lbl_rel_type.setStyleSheet(
+                "color:#6e6e73;font-size:11px;padding:2px 0;")
+
+    def _detect_rel_type(self, src_fp: str, dst_fp: str) -> str:
+        """根据来源与衍生素材的文件类型自动确定关系类型"""
+        src_t = get_asset_type(src_fp)
+        dst_t = get_asset_type(dst_fp)
+        if dst_t == 'video':
+            return 'image_to_video' if src_t == 'image' else 'video_to_video'
+        return 'image_to_image'
+
     def _tab_canva(self):
         w = QWidget(); v = QVBoxLayout(w)
         v.addWidget(QLabel("为一组素材生成唯一ID，将ID复制到Canva模板名称中（如：夏日促销【20260313210000】）"))
@@ -516,7 +619,7 @@ class MamApp(QMainWindow):
         if not src_fp or not dst_fp:
             QMessageBox.warning(self, "提示", "请同时拖入来源素材和衍生素材"); return
         op = self._cfg['user_name']
-        rel_type = self._cmb_rel.currentText().split("（")[0]
+        rel_type = self._detect_rel_type(src_fp, dst_fp)
         def task():
             ph_src, rec_src = ensure_registered(src_fp, op)
             ph_dst, rec_dst = ensure_registered(dst_fp, op)
@@ -1005,8 +1108,13 @@ class MamApp(QMainWindow):
         self._code_table = QTableWidget(0, 3)
         self._code_table.setHorizontalHeaderLabels(["CODE", "真实姓名", "操作"])
         self._code_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._code_table.setMaximumHeight(160)
+        self._code_table.setColumnWidth(0, 110)
+        self._code_table.setColumnWidth(2, 52)
+        self._code_table.verticalHeader().setVisible(False)
+        self._code_table.setMinimumHeight(110)
+        self._code_table.setMaximumHeight(230)
         self._code_table.setAlternatingRowColors(True)
+        self._code_table.setShowGrid(False)
         cv.addWidget(self._code_table)
         self._code_table.itemChanged.connect(self._on_code_table_changed)
 
@@ -1231,5 +1339,128 @@ class MamApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyleSheet("""
+QWidget {
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", sans-serif;
+    font-size: 13px;
+    color: #1d1d1f;
+}
+QMainWindow {
+    background: #f5f5f7;
+}
+QTabWidget::pane {
+    border: none;
+    background: #ffffff;
+}
+QTabBar {
+    background: #f5f5f7;
+}
+QTabBar::tab {
+    background: transparent;
+    color: #6e6e73;
+    padding: 9px 16px;
+    font-size: 12px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+}
+QTabBar::tab:selected {
+    color: #007aff;
+    border-bottom: 2px solid #007aff;
+    font-weight: 600;
+    background: transparent;
+}
+QTabBar::tab:hover:!selected {
+    color: #1d1d1f;
+}
+QPushButton {
+    background: #f2f2f7;
+    border: 1px solid #d1d1d6;
+    border-radius: 8px;
+    padding: 5px 14px;
+    color: #1d1d1f;
+    font-size: 13px;
+    min-height: 28px;
+}
+QPushButton:hover {
+    background: #e8e8ed;
+}
+QPushButton:pressed {
+    background: #d1d1d6;
+}
+QLineEdit, QComboBox {
+    background: #ffffff;
+    border: 1px solid #d1d1d6;
+    border-radius: 8px;
+    padding: 5px 10px;
+    font-size: 13px;
+    selection-background-color: #007aff;
+    min-height: 28px;
+}
+QLineEdit:focus {
+    border-color: #007aff;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+QTableWidget {
+    background: #ffffff;
+    border: 1px solid #e5e5ea;
+    border-radius: 8px;
+    gridline-color: #f2f2f7;
+    selection-background-color: #007aff;
+    selection-color: #ffffff;
+}
+QHeaderView::section {
+    background: #f8f8fb;
+    border: none;
+    border-bottom: 1px solid #e5e5ea;
+    padding: 5px 8px;
+    font-size: 11px;
+    color: #6e6e73;
+    font-weight: 600;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 6px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #c7c7cc;
+    border-radius: 3px;
+    min-height: 24px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal {
+    background: transparent;
+    height: 6px;
+    margin: 0;
+}
+QScrollBar::handle:horizontal {
+    background: #c7c7cc;
+    border-radius: 3px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QProgressBar {
+    background: #e5e5ea;
+    border: none;
+    border-radius: 4px;
+    max-height: 6px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: #007aff;
+    border-radius: 4px;
+}
+QTextEdit {
+    background: #ffffff;
+    border: 1px solid #e5e5ea;
+    border-radius: 8px;
+}
+QFrame[frameShape="4"], QFrame[frameShape="5"] {
+    color: #e5e5ea;
+}
+""")
     win = MamApp(); win.show()
     sys.exit(app.exec())
