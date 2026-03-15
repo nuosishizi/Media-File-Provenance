@@ -593,13 +593,31 @@ class MamApp(QMainWindow):
         """窗口显示后在后台线程初始化数据库连接，不阻塞 UI。"""
         self._log("⏳ 正在连接数据库...")
         w = Worker(lambda: db.connect())
-        w.done.connect(lambda r: self._log(
-            "✅ 数据库连接成功" if r[0] else f"⚠️ 数据库: {r[1]}"
-        ))
+
+        def _on_db_init_done(result):
+            ok, msg = result
+            self._log("✅ 数据库连接成功" if ok else f"⚠️ 数据库: {msg}")
+            if ok:
+                self._refresh_code_table_after_db_connect()
+
+        w.done.connect(_on_db_init_done)
         w.error.connect(lambda e: self._log(f"⚠️ 数据库连接异常: {e}"))
         w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
         self._workers.append(w)
         w.start()
+
+    def _refresh_code_table_after_db_connect(self):
+        """数据库连通后刷新人员代码表，避免扫描时 code_map 为空。"""
+        if not hasattr(self, '_code_table'):
+            return
+        if self._code_table_dirty:
+            self._log("ℹ️ 人员代码有未保存修改，跳过自动刷新")
+            return
+        old_count = self._code_table.rowCount()
+        self._load_code_table()
+        new_count = self._code_table.rowCount()
+        if new_count != old_count:
+            self._log(f"👤 已加载人员名单：{new_count} 条")
 
     def _recommended_workers(self, cap=8):
         cpu = os.cpu_count() or 4
@@ -2767,6 +2785,8 @@ class MamApp(QMainWindow):
                     ok2, msg2 = result
                     self._lbl_user.setText(f"操作员 · {self._cfg['user_name']}")
                     self._log("✅ 设置保存，数据库重连" + ("成功" if ok2 else f"失败: {msg2}"))
+                    if ok2:
+                        self._refresh_code_table_after_db_connect()
                     if not ok2:
                         QMessageBox.warning(
                             self,
@@ -3268,6 +3288,11 @@ class MamApp(QMainWindow):
             v = self._code_table.item(r, 1)
             if k and v and k.text().strip():
                 codes[k.text().strip().upper()] = v.text().strip()
+        if not codes and db.conn:
+            db_codes = db.get_producer_codes() or {}
+            if db_codes and not self._code_table_dirty:
+                self._load_code_table()
+            return dict(db_codes)
         return codes
 
     def _do_scan_start(self):

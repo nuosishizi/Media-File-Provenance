@@ -43,6 +43,22 @@ except ImportError:
     _MUTAGEN_MP4 = False
 
 
+def _win_no_window_kwargs() -> dict:
+    """Windows 下隐藏外部进程控制台窗口，避免扫描时弹黑窗。"""
+    if not sys.platform.startswith('win'):
+        return {}
+    kwargs = {}
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs['startupinfo'] = si
+    except Exception:
+        pass
+    if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+    return kwargs
+
+
 # ─────────────────────────────────────────────────────
 # exiftool 动态检测（每次调用，放入即生效）
 # ─────────────────────────────────────────────────────
@@ -244,7 +260,12 @@ def _exiftool_write(filepath: str, record: dict) -> bool:
 
         # 文件路径直接传（不写入 argfile），Windows 可正确处理中文路径
         cmd = [exe, "-@", args_file, os.path.abspath(filepath)]
-        result = subprocess.run(cmd, capture_output=True, timeout=15)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=15,
+            **_win_no_window_kwargs()
+        )
         if result.returncode != 0:
             err = result.stderr.decode("utf-8", errors="ignore").strip()
             _log_warn(f"exiftool 错误: {err}")
@@ -275,7 +296,8 @@ def _exiftool_read(filepath: str) -> str | None:
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="ignore", timeout=10
+            encoding="utf-8", errors="ignore", timeout=10,
+            **_win_no_window_kwargs()
         )
         out = result.stdout.strip()
         return out if out else None
