@@ -23,9 +23,9 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTabWidget, QTableWidget, QTableWidgetItem,
     QMessageBox, QFormLayout, QFrame, QTextEdit, QHeaderView, QScrollArea,
     QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QSplitter, QComboBox,
-    QFileDialog, QProgressBar, QStackedWidget, QSpinBox, QCheckBox
+    QFileDialog, QProgressBar, QProgressDialog, QStackedWidget, QSpinBox, QCheckBox
 )
-from PyQt6.QtCore  import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore  import Qt, QThread, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui   import QPixmap, QImage, QColor, QFont
 
 # 兼容层：保留现有方法中的控件名，底层统一使用 PyQt6 原生控件
@@ -94,6 +94,63 @@ def _install_exception_hook():
         except:
             pass
     sys.excepthook = _hook
+
+
+# ─── 单实例检测（Windows）────────────────────────────
+def _activate_existing_main_window():
+    """找到已运行的 MAMDesktop 主窗口并激活到前台。"""
+    import ctypes
+    import ctypes.wintypes
+    user32 = ctypes.windll.user32
+    TARGET = "MAM 素材溯源管理系统"
+    found = [None]
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.LPARAM,
+    )
+
+    def _enum_cb(hwnd, lparam):
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n > 0:
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if TARGET in buf.value:
+                found[0] = hwnd
+                return False   # 找到后停止枚举
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+    hwnd = found[0]
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)      # SW_RESTORE（最小化时还原）
+        user32.SetForegroundWindow(hwnd)
+
+
+def _single_instance_check() -> bool:
+    """
+    返回 True 表示本进程是第一个实例，可以继续启动。
+    返回 False 表示已有实例在运行，已激活其窗口，当前进程应退出。
+    非 Windows 平台始终返回 True。
+    """
+    if not sys.platform.startswith('win'):
+        return True
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    MUTEX_NAME = "Local\\MAMDesktop_SingleInstance_v31"
+    mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    err = kernel32.GetLastError()   # 183 = ERROR_ALREADY_EXISTS
+    if err == 183:
+        _activate_existing_main_window()
+        if mutex:
+            kernel32.CloseHandle(mutex)
+        return False
+    # 第一个实例：把 mutex 句柄挂到 builtins，防止 GC 释放
+    import builtins
+    builtins._mam_single_instance_mutex = mutex
+    return True
+
 
 # ─────────────────────────────────────────────────────
 # 辅助：确保素材已在库中（自动登记）
@@ -523,14 +580,26 @@ class MamApp(QMainWindow):
         self._build_ui()
         log_bus.sig.connect(self._log)
         self._log(f"🧭 诊断日志: {DIAG_LOG_FILE}")
-        ok, msg = db.connect()
-        self._log("✅ 数据库连接成功" if ok else f"⚠️ 数据库: {msg}")
+        # 延迟连接数据库，避免窗口显示前卡住主线程
+        QTimer.singleShot(200, self._init_db_connect)
         # exiftool 状态
         self._log(exiftool_status())
         # 检查 Python 依赖
         missing = check_deps()
         for m in missing:
             self._log(f"⚠️ 缺少依赖: {m}")
+
+    def _init_db_connect(self):
+        """窗口显示后在后台线程初始化数据库连接，不阻塞 UI。"""
+        self._log("⏳ 正在连接数据库...")
+        w = Worker(lambda: db.connect())
+        w.done.connect(lambda r: self._log(
+            "✅ 数据库连接成功" if r[0] else f"⚠️ 数据库: {r[1]}"
+        ))
+        w.error.connect(lambda e: self._log(f"⚠️ 数据库连接异常: {e}"))
+        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
+        self._workers.append(w)
+        w.start()
 
     def _recommended_workers(self, cap=8):
         cpu = os.cpu_count() or 4
@@ -2683,15 +2752,47 @@ class MamApp(QMainWindow):
                 db.save_conf(db.conf)
 
                 self._log(f"⚙️ 尝试重连数据库: host={host}, port={port}, user={user}, db={db_name}")
-                ok, msg = db.connect()
-                self._lbl_user.setText(f"操作员 · {self._cfg['user_name']}")
-                self._log("✅ 设置保存，数据库重连" + ("成功" if ok else f"失败: {msg}"))
-                if not ok:
-                    QMessageBox.warning(
+
+                # 在后台线程连接，避免卡主线程；进度框提供视觉反馈
+                progress = QProgressDialog("正在连接数据库，请稍候…", "", 0, 0, self)
+                progress.setCancelButton(None)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+
+                _conn_worker = Worker(lambda: db.connect())
+
+                def _on_conn_done(result, _u=user_name):
+                    progress.close()
+                    ok2, msg2 = result
+                    self._lbl_user.setText(f"操作员 · {self._cfg['user_name']}")
+                    self._log("✅ 设置保存，数据库重连" + ("成功" if ok2 else f"失败: {msg2}"))
+                    if not ok2:
+                        QMessageBox.warning(
+                            self,
+                            "数据库连接失败",
+                            f"连接失败：{msg2}\n\n请查看诊断日志：{DIAG_LOG_FILE}"
+                        )
+
+                def _on_conn_err(e):
+                    progress.close()
+                    _append_diag_log("设置重连异常", e)
+                    self._log(f"❌ 设置保存失败: {e}")
+                    QMessageBox.critical(
                         self,
-                        "数据库连接失败",
-                        f"连接失败：{msg}\n\n请查看诊断日志：{DIAG_LOG_FILE}"
+                        "设置保存失败",
+                        f"错误：{e}\n\n请查看诊断日志：{DIAG_LOG_FILE}"
                     )
+
+                _conn_worker.done.connect(_on_conn_done)
+                _conn_worker.error.connect(_on_conn_err)
+                _conn_worker.finished.connect(
+                    lambda: self._workers.remove(_conn_worker)
+                    if _conn_worker in self._workers else None
+                )
+                self._workers.append(_conn_worker)
+                _conn_worker.start()
+                progress.exec()   # 阻塞 UI 直到 progress.close() 被 worker 信号触发
             except Exception as e:
                 _append_diag_log("系统设置保存异常", traceback.format_exc())
                 self._log(f"❌ 设置保存失败: {e}")
@@ -3241,6 +3342,23 @@ class MamApp(QMainWindow):
 
 if __name__ == "__main__":
     _install_exception_hook()
+
+    # ── Windows DPI 感知（必须在 QApplication 创建之前调用）──────
+    # 不设置时 Windows 11 会用 GDI 缩放，导致窗口位置计算错误甚至不显示
+    if sys.platform.startswith('win'):
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(2)   # Per-Monitor DPI Aware v2
+        except Exception:
+            try:
+                windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    # ── 单实例检测：已有实例运行时激活其窗口并退出 ──────────────
+    if not _single_instance_check():
+        sys.exit(0)
+
     try:
         app = QApplication.instance() or QApplication(sys.argv)
         app.setStyleSheet("""
