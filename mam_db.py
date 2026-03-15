@@ -24,6 +24,8 @@ class DBManager:
     def __init__(self):
         self.conn = None
         self.conf = self._load_conf()
+        self._phash_cache = None  # 缓存所有 phash（用于快速去重）
+        self._producer_codes_cache = None  # 缓存产生者代码
 
     def _load_conf(self):
         if os.path.exists(DB_CONFIG_FILE):
@@ -49,6 +51,8 @@ class DBManager:
                 cursorclass=pymysql.cursors.DictCursor, autocommit=True
             )
             self._init_tables()
+            # 连接成功后立即初始化缓存
+            self._refresh_cache()
             return True, "连接成功"
         except Exception as e:
             return False, str(e)
@@ -151,6 +155,21 @@ class DBManager:
                     except:
                         pass
 
+            # ── 添加索引以提升查询性能 ─────────────────────
+            indexes = [
+                ("CREATE INDEX IF NOT EXISTS idx_assets_producer ON assets(producer)", "assets producer"),
+                ("CREATE INDEX IF NOT EXISTS idx_assets_filename ON assets(filename(20))", "assets filename"),
+                ("CREATE INDEX IF NOT EXISTS idx_rel_derive_src ON rel_derive(src_phash)", "rel_derive src"),
+                ("CREATE INDEX IF NOT EXISTS idx_rel_derive_dst ON rel_derive(dst_phash)", "rel_derive dst"),
+                ("CREATE INDEX IF NOT EXISTS idx_rel_compose_part ON rel_compose(part_phash)", "rel_compose part"),
+                ("CREATE INDEX IF NOT EXISTS idx_rel_compose_product ON rel_compose(product_phash)", "rel_compose product"),
+            ]
+            for sql, desc in indexes:
+                try:
+                    cur.execute(sql)
+                except:
+                    pass  # 索引可能已存在
+
     # ── 写入 / 更新 ─────────────────────────────────────
     def upsert_asset(self, phash, filename, asset_type, file_size,
                      producer, created_at, metadata_json, thumbnail=None):
@@ -194,6 +213,23 @@ class DBManager:
                         (part_phash, product_phash, part_order, part_role, created_at)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (ph, product_phash, i, role, datetime.now()))
+        self._phash_cache = None  # 清空缓存，触发下次刷新
+
+    # ── 缓存管理 ────────────────────────────────────────
+    def _refresh_cache(self):
+        """连接成功后立即加载缓存，加速后续查询"""
+        if not self.conn:
+            return
+        try:
+            with self.conn.cursor() as cur:
+                # 缓存所有 phash 用于快速去重检查
+                cur.execute("SELECT phash FROM assets")
+                self._phash_cache = {r['phash'] for r in cur.fetchall()}
+                # 缓存产生者代码用于 UI 快速显示
+                self._producer_codes_cache = self.get_producer_codes()
+        except:
+            self._phash_cache = set()
+            self._producer_codes_cache = {}
 
     def add_canva_template(self, template_id, name, creator, phash_list, remark=""):
         if not self.conn:
@@ -212,28 +248,45 @@ class DBManager:
 
     # ── 查询 ────────────────────────────────────────────
     def lookup(self, phash, threshold=12):
-        """模糊查询：汉明距离 ≤ threshold 时返回最相近记录"""
+        """模糊查询：汉明距离 ≤ threshold 时返回最相近记录（优化版：使用缓存）"""
         if not self.conn or not phash:
             return None
+        
+        # 首先尝试精确匹配（最常见情况）
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT phash,filename,asset_type,file_size,producer,"
-                "created_at,metadata_json FROM assets"
+                "SELECT phash, filename, asset_type, file_size, producer, "
+                "created_at, metadata_json FROM assets WHERE phash = %s",
+                (phash,)
+            )
+            exact = cur.fetchone()
+            if exact:
+                exact['distance'] = 0
+                exact['similarity'] = "100%"
+                return exact
+        
+        # 若无精确匹配，进行模糊查询
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT phash, filename, asset_type, file_size, producer, "
+                "created_at, metadata_json FROM assets"
             )
             rows = cur.fetchall()
+        
         best, best_d = None, 64
         for r in rows:
             d = _hamming(phash, r['phash'])
             if d < best_d:
                 best_d = d
                 best = r
+        
         if best and best_d <= threshold:
-            best['distance']   = best_d
+            best['distance'] = best_d
             best['similarity'] = f"{int((1 - best_d/64)*100)}%"
             return best
         return None
 
-    # ── 递归溯源链 ──────────────────────────────────────
+    # ── 递归溯源链（优化：避免 visited.copy() 副本）──────────────────────────────────────
     def _get_derive_chain_up(self, phash, visited=None, depth=0, max_depth=8):
         """递归向上：此 phash 是从哪些素材衍生而来（返回带 ancestors 键的行列表）"""
         if visited is None:
@@ -254,8 +307,9 @@ class DBManager:
         except:
             return []
         for row in rows:
+            # 直接传递 visited 集合，避免 .copy() 操作，同时新加项目会被追踪
             row['ancestors'] = self._get_derive_chain_up(
-                row['src_phash'], visited.copy(), depth + 1, max_depth
+                row['src_phash'], visited, depth + 1, max_depth
             )
         return rows
 
@@ -279,8 +333,9 @@ class DBManager:
         except:
             return []
         for row in rows:
+            # 直接传递 visited 集合，避免 .copy() 操作，同时新加项目会被追踪
             row['descendants'] = self._get_derive_chain_down(
-                row['dst_phash'], visited.copy(), depth + 1, max_depth
+                row['dst_phash'], visited, depth + 1, max_depth
             )
         return rows
 

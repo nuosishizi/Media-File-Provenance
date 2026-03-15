@@ -380,8 +380,9 @@ class ScanWorker(QThread):
 # 后台线程
 # ─────────────────────────────────────────────────────
 class Worker(QThread):
-    done  = pyqtSignal(object)
-    error = pyqtSignal(str)
+    done     = pyqtSignal(object)
+    error    = pyqtSignal(str)
+    progress = pyqtSignal(int)  # 0-100
     def __init__(self, fn): super().__init__(); self._fn = fn
     def run(self):
         try:   self.done.emit(self._fn())
@@ -399,6 +400,7 @@ class MamApp(QMainWindow):
         self._workers = []
         self._lib_data = []
         self._last_canva_id = None
+        self._current_worker = None  # 当前后台 worker，用于发送进度信号
         self._build_ui()
         log_bus.sig.connect(self._log)
         ok, msg = db.connect()
@@ -498,10 +500,24 @@ class MamApp(QMainWindow):
         log_l.setSpacing(8)
         log_title = QLabel("运行日志")
         log_title.setObjectName("logTitle")
+        
+        # 添加进度条
+        self._progress = QProgressBar()
+        self._progress.setMaximumHeight(20)
+        self._progress.setTextVisible(True)
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setStyleSheet(
+            "QProgressBar { border: 1px solid #dbe4ee; border-radius: 4px; background: #f5f5f7; }"
+            "QProgressBar::chunk { background: #2980b9; border-radius: 3px; }"
+        )
+        self._progress.hide()  # 默认隐藏，任务时显示
+        
         self._log_box = TextEdit(); self._log_box.setReadOnly(True)
         self._log_box.setMaximumHeight(150)
         self._log_box.setObjectName("logbox")
         log_l.addWidget(log_title)
+        log_l.addWidget(self._progress)
         log_l.addWidget(self._log_box)
         right_l.addWidget(log_card)
 
@@ -990,10 +1006,30 @@ class MamApp(QMainWindow):
     # ═══════════════════ 后台任务 ═════════════════════
     def _bg(self, fn, done_cb=None, msg="操作"):
         w = Worker(fn)
-        w.done.connect(lambda r: (done_cb(r) if done_cb else None,
-                                   self._log(f"✅ {msg}完成")))
-        w.error.connect(lambda e: self._log(f"❌ {msg}失败: {e}"))
-        w.start(); self._workers.append(w)
+        self._current_worker = w
+        def on_done(r):
+            self._progress.setVisible(False)  # 任务完成隐藏进度条
+            self._current_worker = None
+            if done_cb:
+                done_cb(r)
+            self._log(f"✅ {msg}完成")
+        
+        def on_error(e):
+            self._progress.setVisible(False)
+            self._current_worker = None
+            self._log(f"❌ {msg}失败: {e}")
+        
+        w.done.connect(on_done)
+        w.error.connect(on_error)
+        w.progress.connect(lambda v: (self._progress.setVisible(True), 
+                                       self._progress.setValue(v)))
+        w.start()
+        self._workers.append(w)
+    
+    def report_progress(self, percent):
+        """后台任务可调用此方法报告进度（0-100）"""
+        if self._current_worker:
+            self._current_worker.progress.emit(percent)
 
     def _log(self, msg):
         self._log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}]  {msg}")
@@ -1005,7 +1041,8 @@ class MamApp(QMainWindow):
         op = self._cfg['user_name']
         code_map = self._get_code_map()   # 在主线程读取，供后台任务使用
         def task():
-            for fp in fps:
+            total = len(fps)
+            for idx, fp in enumerate(fps):
                 img = get_thumbnail(fp)
                 if img is None: gui_log(f"⚠️ 无法读取: {os.path.basename(fp)}"); continue
                 ph, src = get_phash_from_file(fp, img)
@@ -1032,6 +1069,9 @@ class MamApp(QMainWindow):
                                 make_thumb_bytes(img))
                 src_tag = "（从文件名识别）" if producer != op else ""
                 gui_log(f"✅ 已登记: {fname}  作者:{producer}{src_tag}  phash:{ph}")
+                # 报告进度
+                progress_percent = int((idx + 1) / total * 100)
+                self.report_progress(progress_percent)
             return {}
         self._bg(task, msg="素材登记")
 
@@ -2538,9 +2578,9 @@ class MamApp(QMainWindow):
         btn_fill_clip.clicked.connect(fill_from_clipboard)
 
         def do_import():
+            """后台线程中执行：解析文本、数据库插入；主线程中执行：UI 更新"""
             text = (ta.toPlainText() or "").replace('\u00a0', ' ').replace('\u3000', ' ')
-            added = updated = skipped = 0
-
+            
             def clean_cell(s: str) -> str:
                 s = (s or "").strip().strip('"').strip("'").strip()
                 return s.replace('\u00a0', ' ').replace('\u3000', ' ')
@@ -2584,47 +2624,76 @@ class MamApp(QMainWindow):
                     return None
                 return code.upper()
 
-            for line in text.splitlines():
-                pair = parse_line(line)
-                if not pair:
-                    skipped += 1
-                    continue
-                code_raw, name_raw = pair
-                code = normalize_code(code_raw)
-                name = clean_cell(name_raw)
-                # 自动跳过表头
-                if code and code.upper() in {"CODE", "ID", "NO"} and name in {
-                    "姓名", "真实姓名", "制作人", "人员", "名称", "NAME"
-                }:
-                    continue
-                if not code or not name:
-                    skipped += 1
-                    continue
-
-                db.upsert_producer_code(code, name)
-                # 更新或插入表格行
-                found = False
-                for r in range(self._code_table.rowCount()):
-                    ci = self._code_table.item(r, 0)
-                    if ci and ci.text().upper() == code:
-                        self._code_table.blockSignals(True)
-                        self._code_table.item(r, 1).setText(name)
-                        self._code_table.blockSignals(False)
-                        found = True
+            # ── 后台任务：解析 + DB 插入 ──
+            def bg_task():
+                added = updated = skipped = 0
+                to_add = []    # (code, name) 待添加
+                to_update = {} # code -> name 待更新
+                
+                for line in text.splitlines():
+                    pair = parse_line(line)
+                    if not pair:
+                        skipped += 1
+                        continue
+                    code_raw, name_raw = pair
+                    code = normalize_code(code_raw)
+                    name = clean_cell(name_raw)
+                    # 自动跳过表头
+                    if code and code.upper() in {"CODE", "ID", "NO"} and name in {
+                        "姓名", "真实姓名", "制作人", "人员", "名称", "NAME"
+                    }:
+                        continue
+                    if not code or not name:
+                        skipped += 1
+                        continue
+                    
+                    # 在后台线程中数据库操作，收集 UI 更新清单
+                    db.upsert_producer_code(code, name)
+                    # 检查是否已经存在
+                    existing = any(self._code_table.item(r, 0).text().upper() == code 
+                                   for r in range(self._code_table.rowCount()) 
+                                   if self._code_table.item(r, 0))
+                    if existing:
+                        to_update[code] = name
                         updated += 1
-                        break
-                if not found:
+                    else:
+                        to_add.append((code, name))
+                        added += 1
+                
+                return {'added': added, 'updated': updated, 'skipped': skipped, 
+                        'to_add': to_add, 'to_update': to_update}
+            
+            def on_import_done(result):
+                """主线程回调：更新 UI"""
+                added = result['added']
+                updated = result['updated']
+                skipped = result['skipped']
+                
+                # 更新现有行
+                for code, name in result['to_update'].items():
+                    for r in range(self._code_table.rowCount()):
+                        ci = self._code_table.item(r, 0)
+                        if ci and ci.text().upper() == code:
+                            self._code_table.blockSignals(True)
+                            self._code_table.item(r, 1).setText(name)
+                            self._code_table.blockSignals(False)
+                            break
+                
+                # 添加新行
+                for code, name in result['to_add']:
                     self._insert_code_row(code, name)
-                    added += 1
-
-            msg = f"新增 {added} 条，更新 {updated} 条"
-            if skipped:
-                msg += f"，跳过 {skipped} 行"
-            stat_lbl.setText(f"✅ {msg}")
-            self._log(f"✅ 批量导入完成：{msg}")
-            btn_ok.setText("关闭")
-            btn_ok.clicked.disconnect()
-            btn_ok.clicked.connect(d.accept)
+                
+                msg = f"新增 {added} 条，更新 {updated} 条"
+                if skipped:
+                    msg += f"，跳过 {skipped} 行"
+                stat_lbl.setText(f"✅ {msg}")
+                self._log(f"✅ 批量导入完成：{msg}")
+                btn_ok.setText("关闭")
+                btn_ok.clicked.disconnect()
+                btn_ok.clicked.connect(d.accept)
+            
+            # 在后台线程中执行 bg_task
+            self._bg(bg_task, on_import_done, msg="批量导入代码")
 
         btn_ok.clicked.connect(do_import)
         d.exec()
