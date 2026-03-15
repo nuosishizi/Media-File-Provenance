@@ -5,9 +5,11 @@ import os
 import re
 import json
 import cv2
+import threading
 import warnings
 warnings.filterwarnings('ignore')
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from mam_core import (load_config, save_config, get_phash, get_thumbnail,
                        get_file_size, get_asset_type, make_thumb_bytes,
@@ -20,7 +22,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTabWidget, QTableWidget, QTableWidgetItem,
     QMessageBox, QFormLayout, QFrame, QTextEdit, QHeaderView, QScrollArea,
     QDialog, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QSplitter, QComboBox,
-    QFileDialog, QProgressBar, QStackedWidget
+    QFileDialog, QProgressBar, QStackedWidget, QSpinBox, QCheckBox
 )
 from PyQt6.QtCore  import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui   import QPixmap, QImage, QColor, QFont
@@ -276,16 +278,59 @@ class ScanWorker(QThread):
     log_line = pyqtSignal(str)
     finished = pyqtSignal(dict)
 
-    def __init__(self, folder, operator, known_phashes, code_map=None):
+    def __init__(self, folder, operator, known_phashes, code_map=None,
+                 workers=4, upload_batch=120):
         super().__init__()
         self._folder       = folder
         self._operator     = operator
         self._known        = set(known_phashes)   # 线程内独立副本
         self._code_map     = code_map or {}
         self._should_stop  = False
+        self._workers      = max(1, int(workers))
+        self._upload_batch = max(20, int(upload_batch))
 
     def stop(self):
         self._should_stop = True
+
+    def _build_asset_payload(self, fp):
+        """在线程池中执行：读取文件、计算 phash、生成写库载荷。"""
+        if self._should_stop:
+            return {'status': 'stopped', 'fp': fp}
+        img = get_thumbnail(fp)
+        if img is None:
+            return {'status': 'failed', 'fp': fp, 'error': '无法读取缩略图'}
+
+        ph, _ = get_phash_from_file(fp, img)
+        if not ph:
+            return {'status': 'failed', 'fp': fp, 'error': 'phash 计算失败'}
+
+        fname = os.path.basename(fp)
+        atype = get_asset_type(fp)
+        fsize = get_file_size(fp)
+        now = datetime.now()
+        producer = parse_producer_from_filename(fname, self._code_map) or self._operator
+        rec = {
+            "phash": ph,
+            "filename": fname,
+            "asset_type": atype,
+            "file_size": fsize,
+            "producer": producer,
+            "created_at": now.isoformat(),
+        }
+
+        write_metadata(fp, rec)
+        payload = (
+            ph, fname, atype, fsize, producer, now,
+            json.dumps(rec, ensure_ascii=False, default=str),
+            make_thumb_bytes(img)
+        )
+        return {
+            'status': 'ok',
+            'fp': fp,
+            'fname': fname,
+            'phash': ph,
+            'payload': payload,
+        }
 
     def run(self):
         folder      = self._folder
@@ -312,63 +357,88 @@ class ScanWorker(QThread):
                                 'failed': 0, 'canva_id': canva_id, 'stopped': False})
             return
 
-        added = skipped = failed = 0
+        # 扫描线程使用独立数据库连接，避免和 UI 操作共享连接导致卡顿
+        scan_db = DBManager()
+        scan_db.conf = dict(db.conf)
+        ok, msg = scan_db.connect()
+        if not ok:
+            self.log_line.emit(f"❌ 扫描线程数据库连接失败: {msg}")
+            self.finished.emit({'total': total, 'added': 0, 'skipped': 0,
+                                'failed': total, 'canva_id': canva_id, 'stopped': False})
+            return
+
+        added = skipped = failed = done = 0
         canva_phashes = []
 
-        for i, fp in enumerate(all_files):
-            if self._should_stop:
-                break
-            try:
-                img = get_thumbnail(fp)
-                if img is None:
+        upload_buffer = []
+        executor = ThreadPoolExecutor(max_workers=self._workers)
+        futures = [executor.submit(self._build_asset_payload, fp) for fp in all_files]
+        try:
+            for future in as_completed(futures):
+                if self._should_stop:
+                    for f in futures:
+                        f.cancel()
+                    break
+
+                done += 1
+                try:
+                    result = future.result()
+                except Exception as e:
                     failed += 1
-                    self.progress.emit(total, i + 1, added, skipped, failed)
+                    self.log_line.emit(f"❌ 处理异常: {str(e)[:80]}")
+                    self.progress.emit(total, done, added, skipped, failed)
                     continue
-                ph, _ = get_phash_from_file(fp, img)
-                if not ph:
+
+                status = result.get('status')
+                if status == 'failed':
                     failed += 1
-                    self.progress.emit(total, i + 1, added, skipped, failed)
+                    self.log_line.emit(f"❌ {os.path.basename(result.get('fp', ''))}: {result.get('error', '处理失败')}")
+                    self.progress.emit(total, done, added, skipped, failed)
                     continue
+                if status == 'stopped':
+                    self.progress.emit(total, done, added, skipped, failed)
+                    continue
+
+                ph = result['phash']
                 if ph in self._known:
                     skipped += 1
                     if canva_id:
                         canva_phashes.append(ph)
-                    self.progress.emit(total, i + 1, added, skipped, failed)
+                    self.progress.emit(total, done, added, skipped, failed)
                     continue
-                # 新素材 → 注册并写入元数据
-                fname    = os.path.basename(fp)
-                atype    = get_asset_type(fp)
-                fsize    = get_file_size(fp)
-                now      = datetime.now()
-                producer = parse_producer_from_filename(fname, self._code_map)
-                rec   = {"phash": ph, "filename": fname, "asset_type": atype,
-                         "file_size": fsize, "producer": producer,
-                         "created_at": now.isoformat()}
-                write_metadata(fp, rec)
-                db.upsert_asset(ph, fname, atype, fsize, producer, now,
-                                json.dumps(rec, ensure_ascii=False, default=str),
-                                make_thumb_bytes(img))
+
                 self._known.add(ph)
+                upload_buffer.append(result['payload'])
+                added += 1
                 if canva_id:
                     canva_phashes.append(ph)
-                added += 1
-                if added % 50 == 1:
-                    self.log_line.emit(f"✅ 新增: {fname[:45]}  phash:{ph}")
-            except Exception as e:
-                failed += 1
-                self.log_line.emit(f"❌ {os.path.basename(fp)}: {str(e)[:80]}")
-            self.progress.emit(total, i + 1, added, skipped, failed)
+
+                if len(upload_buffer) >= self._upload_batch:
+                    scan_db.upsert_assets_bulk(upload_buffer)
+                    upload_buffer.clear()
+
+                if added % 100 == 0:
+                    self.log_line.emit(f"✅ 已新增 {added} 个素材")
+
+                self.progress.emit(total, done, added, skipped, failed)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        if upload_buffer:
+            scan_db.upsert_assets_bulk(upload_buffer)
 
         # ── Canva 模板自动登记 ───────────────────────────
         if canva_id and canva_phashes:
             try:
                 unique_ph = list(dict.fromkeys(canva_phashes))
-                db.add_canva_template(canva_id, canva_name, self._operator, unique_ph)
+                scan_db.add_canva_template(canva_id, canva_name, self._operator, unique_ph)
                 self.log_line.emit(
                     f"🎨 Canva模板【{canva_id}】({canva_name}) 已登记，关联{len(unique_ph)}个素材"
                 )
             except Exception as e:
                 self.log_line.emit(f"⚠️ Canva模板登记失败: {e}")
+
+        scan_db.close()
 
         self.finished.emit({
             'total': total, 'added': added, 'skipped': skipped,
@@ -401,6 +471,7 @@ class MamApp(QMainWindow):
         self._lib_data = []
         self._last_canva_id = None
         self._current_worker = None  # 当前后台 worker，用于发送进度信号
+        self._code_table_dirty = False
         self._build_ui()
         log_bus.sig.connect(self._log)
         ok, msg = db.connect()
@@ -411,6 +482,10 @@ class MamApp(QMainWindow):
         missing = check_deps()
         for m in missing:
             self._log(f"⚠️ 缺少依赖: {m}")
+
+    def _recommended_workers(self, cap=8):
+        cpu = os.cpu_count() or 4
+        return max(2, min(cap, cpu))
 
     # ═══════════════════ UI 构建 ═══════════════════════
     def _build_ui(self):
@@ -908,6 +983,22 @@ class MamApp(QMainWindow):
         left_title.setStyleSheet("font-size:15px;font-weight:700;color:#24384f;")
         lv.addWidget(left_title)
 
+        perf_row = QHBoxLayout()
+        perf_row.addWidget(QLabel("查询线程："))
+        self._query_threads = QSpinBox()
+        self._query_threads.setRange(1, 32)
+        self._query_threads.setValue(int(self._cfg.get('query_threads', self._recommended_workers())))
+        self._query_threads.setToolTip("并发处理查询文件的线程数")
+        self._query_threads.setMaximumWidth(90)
+        perf_row.addWidget(self._query_threads)
+        perf_row.addStretch(1)
+        lv.addLayout(perf_row)
+
+        self._query_fuzzy = QCheckBox("启用慢速模糊匹配（速度慢，兼容轻微改图）")
+        self._query_fuzzy.setChecked(bool(self._cfg.get('query_fuzzy', False)))
+        self._query_fuzzy.setStyleSheet("font-size:12px;color:#516980;")
+        lv.addWidget(self._query_fuzzy)
+
         self._drop_query = DropArea("拖入文件（支持多个）", multi=True)
         self._drop_query.setMinimumHeight(180)
         lv.addWidget(self._drop_query)
@@ -1004,7 +1095,7 @@ class MamApp(QMainWindow):
         return w
 
     # ═══════════════════ 后台任务 ═════════════════════
-    def _bg(self, fn, done_cb=None, msg="操作"):
+    def _bg(self, fn, done_cb=None, msg="操作", err_cb=None):
         w = Worker(fn)
         self._current_worker = w
         def on_done(r):
@@ -1017,6 +1108,8 @@ class MamApp(QMainWindow):
         def on_error(e):
             self._progress.setVisible(False)
             self._current_worker = None
+            if err_cb:
+                err_cb(e)
             self._log(f"❌ {msg}失败: {e}")
         
         w.done.connect(on_done)
@@ -2128,18 +2221,66 @@ class MamApp(QMainWindow):
     def _do_query(self):
         fps = self._drop_query.files()
         if not fps: QMessageBox.warning(self, "提示", "请先拖入要查询的文件"); return
+
+        worker_count = int(self._query_threads.value()) if hasattr(self, '_query_threads') else self._recommended_workers()
+        enable_fuzzy = self._query_fuzzy.isChecked() if hasattr(self, '_query_fuzzy') else False
+        self._cfg['query_threads'] = worker_count
+        self._cfg['query_fuzzy'] = enable_fuzzy
+        save_config(self._cfg)
+
         def task():
             results = []
-            for fp in fps:
-                try:
-                    img = get_thumbnail(fp)
-                    ph, _ = get_phash_from_file(fp, img)
-                    lineage = db.get_lineage(ph) if ph else None
-                except Exception as e:
-                    gui_log(f"❌ {os.path.basename(fp)}: {e}")
-                    img, lineage = None, None
-                results.append({'fp': fp, 'img': img, 'lineage': lineage})
+
+            db_lock = threading.Lock()
+            thread_dbs = {}
+
+            def get_thread_db():
+                tid = threading.get_ident()
+                with db_lock:
+                    existing = thread_dbs.get(tid)
+                    if existing:
+                        return existing
+                    worker_db = DBManager()
+                    worker_db.conf = dict(db.conf)
+                    ok, msg = worker_db.connect()
+                    if not ok:
+                        raise RuntimeError(msg)
+                    thread_dbs[tid] = worker_db
+                    return worker_db
+
+            def process_one(fp):
+                img = get_thumbnail(fp)
+                ph, _ = get_phash_from_file(fp, img)
+                lineage = None
+                if ph:
+                    ldb = get_thread_db()
+                    lineage = ldb.get_lineage(ph, exact_only=not enable_fuzzy)
+                    if not lineage and enable_fuzzy:
+                        lineage = ldb.get_lineage(ph, exact_only=False)
+                return {'fp': fp, 'img': img, 'lineage': lineage}
+
+            try:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    future_map = {executor.submit(process_one, fp): fp for fp in fps}
+                    total = len(future_map)
+                    done_count = 0
+
+                    for future in as_completed(future_map):
+                        fp = future_map[future]
+                        done_count += 1
+                        try:
+                            res = future.result()
+                        except Exception as e:
+                            gui_log(f"❌ {os.path.basename(fp)}: {e}")
+                            res = {'fp': fp, 'img': None, 'lineage': None}
+                        results.append(res)
+                        self.report_progress(int(done_count / total * 100))
+            finally:
+                for worker_db in thread_dbs.values():
+                    worker_db.close()
+
             return results
+
         def done(results):
             if not results:
                 return
@@ -2193,7 +2334,7 @@ class MamApp(QMainWindow):
                 )
                 self._query_result_lay.addWidget(card)
             self._log(
-                f"✅ 源迹查询完成，展示 {len(merged_results)} 项（合并重复 {merged_count} 项）")
+                f"✅ 源迹查询完成，展示 {len(merged_results)} 项（合并重复 {merged_count} 项，线程 {worker_count}）")
         self._bg(task, done, msg="源迹查询")
     def _do_query_canva(self):
         tid = self._canva_id_search.text().strip()
@@ -2348,16 +2489,16 @@ class MamApp(QMainWindow):
             "background:#8e44ad;color:#fff;height:30px;border:none;"
             "border-radius:5px;font-size:12px;")
         btn_batch.clicked.connect(self._batch_paste_codes)
-        btn_save_codes = PushButton("💾 保存")
-        btn_save_codes.setMinimumWidth(82)
-        btn_save_codes.clicked.connect(self._save_producer_codes)
+        self._btn_save_codes = PushButton("💾 保存")
+        self._btn_save_codes.setMinimumWidth(82)
+        self._btn_save_codes.clicked.connect(self._save_producer_codes)
         add_row.addWidget(QLabel("CODE:"))
         add_row.addWidget(self._code_input)
         add_row.addWidget(QLabel("姓名:"))
         add_row.addWidget(self._name_input)
         add_row.addWidget(btn_add_code)
         add_row.addWidget(btn_batch)
-        add_row.addWidget(btn_save_codes)
+        add_row.addWidget(self._btn_save_codes)
         add_row.addStretch()
         cv.addLayout(add_row)
         v.addWidget(code_box)
@@ -2380,6 +2521,26 @@ class MamApp(QMainWindow):
         btn_br = PushButton("📂 选择"); btn_br.setMinimumWidth(92)
         btn_br.clicked.connect(self._browse_scan_folder)
         fr.addWidget(btn_br); v.addLayout(fr)
+
+        perf = QHBoxLayout()
+        perf.addWidget(QLabel("扫描线程："))
+        self._scan_threads = QSpinBox()
+        self._scan_threads.setRange(1, 32)
+        self._scan_threads.setValue(int(self._cfg.get('scan_threads', self._recommended_workers())))
+        self._scan_threads.setMaximumWidth(90)
+        self._scan_threads.setToolTip("并发读取/计算文件的线程数")
+        perf.addWidget(self._scan_threads)
+
+        perf.addWidget(QLabel("批量写库："))
+        self._scan_upload_batch = QSpinBox()
+        self._scan_upload_batch.setRange(20, 1000)
+        self._scan_upload_batch.setSingleStep(20)
+        self._scan_upload_batch.setValue(int(self._cfg.get('scan_upload_batch', 120)))
+        self._scan_upload_batch.setMaximumWidth(100)
+        self._scan_upload_batch.setToolTip("每累计 N 条新素材后批量写入数据库")
+        perf.addWidget(self._scan_upload_batch)
+        perf.addStretch(1)
+        v.addLayout(perf)
 
         # 操作按钮
         br = QHBoxLayout()
@@ -2431,6 +2592,7 @@ class MamApp(QMainWindow):
         self._code_table.setRowCount(0)
         for code, name in codes.items():
             self._insert_code_row(code, name)
+        self._code_table_dirty = False
 
     def _insert_code_row(self, code, name):
         self._code_table.blockSignals(True)
@@ -2453,27 +2615,29 @@ class MamApp(QMainWindow):
         btn = self.sender()
         for r in range(self._code_table.rowCount()):
             if self._code_table.cellWidget(r, 2) is btn:
-                code_item = self._code_table.item(r, 0)
-                if code_item and code_item.text().strip():
-                    db.delete_producer_code(code_item.text())
-                self._code_table.removeRow(r); break
+                self._code_table.removeRow(r)
+                self._code_table_dirty = True
+                self._log("📝 已标记删除，点击保存后写入数据库")
+                break
 
     def _add_producer_code(self):
         code = self._code_input.text().strip().upper()
         name = self._name_input.text().strip()
         if not code or not name:
             QMessageBox.warning(self, "提示", "CODE 和姓名不能为空"); return
-        db.upsert_producer_code(code, name)
         for r in range(self._code_table.rowCount()):
             if self._code_table.item(r, 0) and                self._code_table.item(r, 0).text().upper() == code:
                 self._code_table.blockSignals(True)
                 self._code_table.item(r, 1).setText(name)
                 self._code_table.blockSignals(False)
                 self._code_input.clear(); self._name_input.clear()
-                self._log(f"✅ 已更新: {code} → {name}"); return
+                self._code_table_dirty = True
+                self._log(f"📝 已更新: {code} → {name}（待保存）")
+                return
         self._insert_code_row(code, name)
         self._code_input.clear(); self._name_input.clear()
-        self._log(f"✅ 已添加: {code} → {name}")
+        self._code_table_dirty = True
+        self._log(f"📝 已添加: {code} → {name}（待保存）")
 
     def _save_producer_codes(self):
         codes = {}
@@ -2482,25 +2646,53 @@ class MamApp(QMainWindow):
             v = self._code_table.item(r, 1)
             if k and v and k.text().strip():
                 codes[k.text().strip().upper()] = v.text().strip()
-        if db.conn:
-            with db.conn.cursor() as cur:
+        if not self._code_table_dirty:
+            self._log("ℹ️ 人员代码无变更，无需保存")
+            return
+
+        if hasattr(self, '_btn_save_codes'):
+            self._btn_save_codes.setEnabled(False)
+            self._btn_save_codes.setText("保存中…")
+
+        def task():
+            worker_db = DBManager()
+            worker_db.conf = dict(db.conf)
+            ok, msg = worker_db.connect()
+            if not ok:
+                raise RuntimeError(msg)
+
+            with worker_db.conn.cursor() as cur:
                 cur.execute("DELETE FROM producer_codes")
-            db.conn.commit()
-            for code, name in codes.items():
-                db.upsert_producer_code(code, name)
-        save_producer_codes(codes)  # JSON 备份
-        self._log(f"✅ 已保存 {len(codes)} 条人员代码到数据库")
+                if codes:
+                    cur.executemany(
+                        "INSERT INTO producer_codes (code, name) VALUES (%s, %s)",
+                        [(c, n) for c, n in codes.items()]
+                    )
+
+            save_producer_codes(codes)  # JSON 备份
+            worker_db.close()
+            return len(codes)
+
+        def done(saved_count):
+            self._code_table_dirty = False
+            db._producer_codes_cache = dict(codes)
+            if hasattr(self, '_btn_save_codes'):
+                self._btn_save_codes.setEnabled(True)
+                self._btn_save_codes.setText("💾 保存")
+            self._log(f"✅ 已保存 {saved_count} 条人员代码到数据库")
+
+        def on_error(_e):
+            if hasattr(self, '_btn_save_codes'):
+                self._btn_save_codes.setEnabled(True)
+                self._btn_save_codes.setText("💾 保存")
+
+        self._bg(task, done, msg="保存人员代码", err_cb=on_error)
 
     def _on_code_table_changed(self, item):
-        """表格内容变化时自动保存到 DB"""
+        """表格内容变化时仅标记待保存，避免编辑即阻塞 UI。"""
         if item.column() not in (0, 1):
             return
-        code_item = self._code_table.item(item.row(), 0)
-        name_item = self._code_table.item(item.row(), 1)
-        if code_item and name_item and \
-                code_item.text().strip() and name_item.text().strip():
-            db.upsert_producer_code(code_item.text().strip(),
-                                    name_item.text().strip())
+        self._code_table_dirty = True
 
     def _batch_paste_codes(self):
         """批量粘贴人员代码对话框"""
@@ -2578,8 +2770,15 @@ class MamApp(QMainWindow):
         btn_fill_clip.clicked.connect(fill_from_clipboard)
 
         def do_import():
-            """后台线程中执行：解析文本、数据库插入；主线程中执行：UI 更新"""
+            """后台线程解析文本，主线程更新表格；最终由“保存”统一落库。"""
             text = (ta.toPlainText() or "").replace('\u00a0', ' ').replace('\u3000', ' ')
+
+            existing_codes = {}
+            for r in range(self._code_table.rowCount()):
+                code_item = self._code_table.item(r, 0)
+                name_item = self._code_table.item(r, 1)
+                if code_item and name_item and code_item.text().strip():
+                    existing_codes[code_item.text().strip().upper()] = name_item.text().strip()
             
             def clean_cell(s: str) -> str:
                 s = (s or "").strip().strip('"').strip("'").strip()
@@ -2624,11 +2823,10 @@ class MamApp(QMainWindow):
                     return None
                 return code.upper()
 
-            # ── 后台任务：解析 + DB 插入 ──
+            # ── 后台任务：仅做解析，避免跨线程访问 UI / DB 连接竞争 ──
             def bg_task():
-                added = updated = skipped = 0
-                to_add = []    # (code, name) 待添加
-                to_update = {} # code -> name 待更新
+                skipped = 0
+                parsed = {}
                 
                 for line in text.splitlines():
                     pair = parse_line(line)
@@ -2646,21 +2844,22 @@ class MamApp(QMainWindow):
                     if not code or not name:
                         skipped += 1
                         continue
-                    
-                    # 在后台线程中数据库操作，收集 UI 更新清单
-                    db.upsert_producer_code(code, name)
-                    # 检查是否已经存在
-                    existing = any(self._code_table.item(r, 0).text().upper() == code 
-                                   for r in range(self._code_table.rowCount()) 
-                                   if self._code_table.item(r, 0))
-                    if existing:
-                        to_update[code] = name
-                        updated += 1
-                    else:
+                    parsed[code] = name
+
+                to_add = []
+                to_update = {}
+                for code, name in parsed.items():
+                    old_name = existing_codes.get(code)
+                    if old_name is None:
                         to_add.append((code, name))
-                        added += 1
+                    elif old_name != name:
+                        to_update[code] = name
                 
-                return {'added': added, 'updated': updated, 'skipped': skipped, 
+                return {
+                        'added': len(to_add),
+                        'updated': len(to_update),
+                        'skipped': skipped,
+                        'parsed': len(parsed),
                         'to_add': to_add, 'to_update': to_update}
             
             def on_import_done(result):
@@ -2668,6 +2867,7 @@ class MamApp(QMainWindow):
                 added = result['added']
                 updated = result['updated']
                 skipped = result['skipped']
+                changed = False
                 
                 # 更新现有行
                 for code, name in result['to_update'].items():
@@ -2677,15 +2877,22 @@ class MamApp(QMainWindow):
                             self._code_table.blockSignals(True)
                             self._code_table.item(r, 1).setText(name)
                             self._code_table.blockSignals(False)
+                            changed = True
                             break
                 
                 # 添加新行
                 for code, name in result['to_add']:
                     self._insert_code_row(code, name)
+                    changed = True
+
+                if changed:
+                    self._code_table_dirty = True
                 
                 msg = f"新增 {added} 条，更新 {updated} 条"
                 if skipped:
                     msg += f"，跳过 {skipped} 行"
+                if changed:
+                    msg += "，请点击保存写入数据库"
                 stat_lbl.setText(f"✅ {msg}")
                 self._log(f"✅ 批量导入完成：{msg}")
                 btn_ok.setText("关闭")
@@ -2714,14 +2921,27 @@ class MamApp(QMainWindow):
             QMessageBox.warning(self, "提示", "请输入或选择有效的文件夹路径"); return
         if not db.conn:
             QMessageBox.warning(self, "提示", "数据库未连接，请先在【系统设置】中连接"); return
+
+        worker_count = int(self._scan_threads.value()) if hasattr(self, '_scan_threads') else self._recommended_workers()
+        upload_batch = int(self._scan_upload_batch.value()) if hasattr(self, '_scan_upload_batch') else 120
+        self._cfg['scan_threads'] = worker_count
+        self._cfg['scan_upload_batch'] = upload_batch
+        save_config(self._cfg)
+
         op = self._cfg['user_name']
         code_map = self._get_code_map()
         self._scan_log.clear()
         self._scan_bar.setValue(0)
         self._scan_stats.setText("正在加载数据库已有素材列表…")
         known = db.get_all_phashes()
-        self._scan_stats.setText(f"数据库已有 {len(known)} 个素材，开始扫描…")
-        self._scan_worker = ScanWorker(folder, op, known, code_map)
+        self._scan_stats.setText(
+            f"数据库已有 {len(known)} 个素材，开始扫描…（线程 {worker_count}，批量写库 {upload_batch}）"
+        )
+        self._scan_worker = ScanWorker(
+            folder, op, known, code_map,
+            workers=worker_count,
+            upload_batch=upload_batch
+        )
         self._scan_worker.progress.connect(self._on_scan_progress)
         self._scan_worker.log_line.connect(self._scan_log.append)
         self._scan_worker.finished.connect(self._on_scan_done)
@@ -2748,6 +2968,10 @@ class MamApp(QMainWindow):
         self._btn_scan_stop.setEnabled(False)
         if not result.get('stopped'):
             self._scan_bar.setValue(100)
+        try:
+            db._refresh_cache()
+        except Exception:
+            pass
         status = "⏸ 已手动停止" if result.get('stopped') else "✅ 扫描完成"
         msg = (f"{status}  |  总计 {result['total']} 个文件  |  "
                f"✅ 新增 {result['added']}  |  "

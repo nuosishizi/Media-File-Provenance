@@ -57,6 +57,15 @@ class DBManager:
         except Exception as e:
             return False, str(e)
 
+    def close(self):
+        """关闭数据库连接。"""
+        if self.conn:
+            try:
+                self.conn.close()
+            except:
+                pass
+            self.conn = None
+
     def _init_tables(self):
         with self.conn.cursor() as cur:
             # ── 主资产表 ────────────────────────────────
@@ -190,7 +199,35 @@ class DBManager:
                     thumbnail     = COALESCE(VALUES(thumbnail), thumbnail)
             """, (phash, filename, asset_type, file_size,
                   producer, created_at, metadata_json, thumbnail))
+        if self._phash_cache is not None and phash:
+            self._phash_cache.add(phash)
         return True
+
+    def upsert_assets_bulk(self, rows):
+        """批量写入素材，显著降低逐条 INSERT 的网络往返成本。"""
+        if not self.conn or not rows:
+            return 0
+        with self.conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO assets
+                    (phash, filename, asset_type, file_size, producer,
+                     created_at, metadata_json, thumbnail)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    filename      = VALUES(filename),
+                    asset_type    = VALUES(asset_type),
+                    file_size     = VALUES(file_size),
+                    producer      = VALUES(producer),
+                    metadata_json = VALUES(metadata_json),
+                    thumbnail     = COALESCE(VALUES(thumbnail), thumbnail)
+            """, rows)
+        if self._phash_cache is not None:
+            for r in rows:
+                try:
+                    self._phash_cache.add(r[0])
+                except:
+                    pass
+        return len(rows)
 
     def add_derive(self, src, dst, rel_type, operator, remark=""):
         if not self.conn:
@@ -264,17 +301,33 @@ class DBManager:
                 exact['distance'] = 0
                 exact['similarity'] = "100%"
                 return exact
-        
-        # 若无精确匹配，进行模糊查询
+
+        # 若无精确匹配，先做前缀候选，避免大库全表扫描
+        candidates = []
         with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT phash, filename, asset_type, file_size, producer, "
-                "created_at, metadata_json FROM assets"
-            )
-            rows = cur.fetchall()
-        
+            for prefix_len in (2, 1):
+                p = phash[:prefix_len]
+                if not p:
+                    continue
+                cur.execute(
+                    "SELECT phash, filename, asset_type, file_size, producer, "
+                    "created_at, metadata_json FROM assets WHERE phash LIKE %s",
+                    (f"{p}%",)
+                )
+                rows = cur.fetchall()
+                if rows:
+                    candidates = rows
+                    break
+
+            if not candidates:
+                cur.execute(
+                    "SELECT phash, filename, asset_type, file_size, producer, "
+                    "created_at, metadata_json FROM assets LIMIT 50000"
+                )
+                candidates = cur.fetchall()
+
         best, best_d = None, 64
-        for r in rows:
+        for r in candidates:
             d = _hamming(phash, r['phash'])
             if d < best_d:
                 best_d = d
@@ -378,11 +431,23 @@ class DBManager:
             assets.append(asset)
         return assets
 
-    def get_lineage(self, phash):
+    def get_lineage(self, phash, exact_only=False):
         """返回完整溯源树 dict（含多级递归衍生链 + Canva 模板引用）"""
         if not self.conn:
             return None
-        base = self.lookup(phash)
+        if exact_only:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT phash, filename, asset_type, file_size, producer, "
+                    "created_at, metadata_json FROM assets WHERE phash = %s",
+                    (phash,)
+                )
+                base = cur.fetchone()
+            if base:
+                base['distance'] = 0
+                base['similarity'] = "100%"
+        else:
+            base = self.lookup(phash)
         if not base:
             return None
         exact = base['phash']
@@ -580,18 +645,24 @@ class DBManager:
         """返回数据库中所有已有 phash 的集合（用于批量扫描快速去重，避免逐条查询）"""
         if not self.conn:
             return set()
+        if self._phash_cache is not None:
+            return set(self._phash_cache)
         with self.conn.cursor() as cur:
             cur.execute("SELECT phash FROM assets")
-            return {r['phash'] for r in cur.fetchall()}
+            self._phash_cache = {r['phash'] for r in cur.fetchall()}
+            return set(self._phash_cache)
 
     # ── 人员代码 CRUD ────────────────────────────────────────────────────────
     def get_producer_codes(self) -> dict:
         """返回 {code: name} 字典"""
         if not self.conn:
             return {}
+        if self._producer_codes_cache is not None:
+            return dict(self._producer_codes_cache)
         with self.conn.cursor() as cur:
             cur.execute("SELECT code, name FROM producer_codes ORDER BY code")
-            return {r['code']: r['name'] for r in cur.fetchall()}
+            self._producer_codes_cache = {r['code']: r['name'] for r in cur.fetchall()}
+            return dict(self._producer_codes_cache)
 
     def upsert_producer_code(self, code: str, name: str):
         if not self.conn:
@@ -602,11 +673,16 @@ class DBManager:
                 ON DUPLICATE KEY UPDATE name = VALUES(name)
             """, (code.upper().strip(), name.strip()))
         self.conn.commit()
+        if self._producer_codes_cache is not None:
+            self._producer_codes_cache[code.upper().strip()] = name.strip()
 
     def delete_producer_code(self, code: str):
         if not self.conn:
             return
+        code = code.upper().strip()
         with self.conn.cursor() as cur:
             cur.execute("DELETE FROM producer_codes WHERE code = %s",
-                        (code.upper().strip(),))
+                        (code,))
         self.conn.commit()
+        if self._producer_codes_cache is not None and code in self._producer_codes_cache:
+            self._producer_codes_cache.pop(code, None)
