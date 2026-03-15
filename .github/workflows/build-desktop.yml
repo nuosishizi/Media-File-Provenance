@@ -51,9 +51,60 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install exiftool -y --no-progress
-          $cmd = Get-Command exiftool.exe -ErrorAction Stop
-          "EXIFTOOL_PATH=$($cmd.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Try to use local exiftool.exe if available
+          if (Test-Path "exiftool.exe") {
+            $exiftoolPath = "$(Get-Item exiftool.exe | Select-Object -ExpandProperty FullName)"
+            Write-Host "Using local exiftool: $exiftoolPath"
+          } else {
+            Write-Host "Local exiftool not found, installing via Chocolatey..."
+            choco install exiftool -y --no-progress
+
+            # Wait a moment for the installation to complete
+            Start-Sleep -Seconds 2
+
+            # Try multiple methods to find exiftool
+            $exiftoolPath = $null
+
+            # Method 1: Get-Command (may need PATH refresh after choco)
+            try {
+              $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+              $cmd = Get-Command exiftool.exe -ErrorAction SilentlyContinue
+              if ($cmd) {
+                $exiftoolPath = $cmd.Source
+                Write-Host "Found exiftool via Get-Command: $exiftoolPath"
+              }
+            } catch {}
+
+            # Method 2: Check common Chocolatey install location
+            if (-not $exiftoolPath) {
+              $chocoPath = "C:\ProgramData\chocolatey\bin\exiftool.exe"
+              if (Test-Path $chocoPath) {
+                $exiftoolPath = $chocoPath
+                Write-Host "Found exiftool in Chocolatey path: $exiftoolPath"
+              }
+            }
+
+            # Method 3: Check Program Files
+            if (-not $exiftoolPath) {
+              $progPath = Get-ChildItem -Path "C:\Program Files*" -Filter "exiftool.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+              if ($progPath) {
+                $exiftoolPath = $progPath
+                Write-Host "Found exiftool in Program Files: $exiftoolPath"
+              }
+            }
+
+            # If still not found, fail with a clear message
+            if (-not $exiftoolPath) {
+              Write-Host "ERROR: Could not find exiftool.exe after installation attempt."
+              Write-Host "Chocolatey bin dir contents:"
+              Get-ChildItem "C:\ProgramData\chocolatey\bin\" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+              exit 1
+            }
+          }
+
+          # Set environment variable
+          "EXIFTOOL_PATH=$exiftoolPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "EXIFTOOL_PATH set to: $exiftoolPath"
 
       - name: Install exiftool on macOS
         if: runner.os == 'macOS'
