@@ -1,5 +1,6 @@
 # mam_core.py — 核心算法 & 文件工具
 import os
+import re
 import json
 import numpy as np
 import cv2
@@ -13,6 +14,10 @@ ALL_EXTS  = IMG_EXTS + VID_EXTS
 CONFIG_FILE       = "mam_config.json"
 DB_CONFIG_FILE    = "mam_db_config.json"
 PRODUCER_CODE_FILE = "mam_producer_codes.json"
+
+# 这些前缀常用于国家/来源标记，不应当作人员代码。
+# 如有误判，可按需继续补充（统一大写）。
+NON_PRODUCER_PREFIX_CODES = {"US"}
 
 
 # ── 人员代码表 ────────────────────────────────────────────────
@@ -34,30 +39,132 @@ def save_producer_codes(codes: dict):
 
 def parse_producer_from_filename(filename: str, code_map: dict) -> str:
     """
-    从文件名解析制作人。
-    格式规则： YYYYMMDD-CODE-描述
-      - 第一段必须是 8 位数字（日期）
-      - 第二段必须是纯字母或纯数字，长度 1~6 位
-    识别到 CODE 后查 code_map 映射到真实姓名；查不到映射则直接返回 CODE。
-    识别不到 CODE 返回 '未知'.
+    从文件名解析制作人。支持多种历史命名格式：
+
+    1. YYYYMMDD-CODE-描述   （标准格式，8位日期）
+       例：20260113-XQ-素材.mp4 / 20260131-34-素材.jpg
+    2. YYYYMM-DD-CODE-描述  （6+2位日期分段）
+       例：202512-05-85-成品.mp4
+    3. CODE + 分隔符 + 描述  （- / _ / 空格）
+       例：LYI-地狱是真实存在.JPG / RC 申命记28_2_你.JPG / FM-_神的时间.JPG
+    4. CODE+数字后缀-描述    （字母+数字混合代码，取字母前缀匹配）
+       例：xy2-2_凡将神放在生.JPG  →  xy 是人员
+    5. CODE直接接中文（无分隔符）
+       例：SXC任何将上帝放在.mp4
+
+    匹配规则（大小写不敏感）：
+    - 先精确匹配 code_map
+    - 首段 CODE（如 RC 空格/横线后接描述）优先作为人员代码
+    - 支持排除前缀（如 US），排除后继续匹配后段代码
+    - 数字代码支持前导零归一化（如 0019 -> 19）
+    - 若 CODE 含字母+数字混合（如 xy2），尝试纯字母前缀匹配
+    - 无分隔符前缀代码（如 SXC如果...）允许回退到代码本身
+    - 识别不到返回 '未知'
     """
-    import re
     name = os.path.splitext(os.path.basename(filename))[0]
-    # 去掉尾部空格+(N)
     name = re.sub(r'\s*\(\d+\)\s*$', '', name).strip()
-    parts = name.split('-')
-    if len(parts) < 2:
-        return '未知'
-    if not re.match(r'^\d{8}$', parts[0].strip()):
-        return '未知'
-    code = parts[1].strip()
-    if not re.match(r'^[A-Za-z0-9]{1,6}$', code):
-        return '未知'
-    # CODE 查对照表（大小写不敏感）
-    for k, v in code_map.items():
-        if k.upper() == code.upper():
-            return v
-    return code  # 有 CODE 但对照表中没有，直接用 CODE
+
+    upper_map = {k.upper(): v for k, v in (code_map or {}).items()}
+
+    def lookup(s):
+        return upper_map.get(s.upper()) if s else None
+
+    def resolve_code(s, mapped_only=False):
+        """CODE → 人名或原码；非法格式返回 None"""
+        if not s or not re.match(r'^[A-Za-z0-9]{1,6}$', s):
+            return None
+        # 1. 精确匹配
+        result = lookup(s)
+        if result:
+            return result
+        # 2. 纯数字代码：支持前导零归一化（0019 -> 19）
+        if s.isdigit():
+            norm = s.lstrip('0') or '0'
+            result = lookup(norm)
+            if result:
+                return result
+            return None if mapped_only else norm
+        # 3. 字母+数字混合（如 xy2）→ 只取字母前缀再匹配
+        m = re.match(r'^([A-Za-z]{1,6})\d+$', s)
+        if m:
+            result = lookup(m.group(1))
+            if result:
+                return result
+        # 4. code_map 无记录 → 原样返回（保留代码）
+        return None if mapped_only else s
+
+    # ── 格式 1：YYYYMMDD-CODE-*（8位日期）──────────────
+    m = re.match(r'^\d{8}[-_\s]+([A-Za-z0-9]{1,6})(?:[-_\s]|$)', name)
+    if m:
+        return resolve_code(m.group(1)) or '未知'
+
+    # ── 格式 2：YYYYMM-DD-CODE-*（6位年月 + 2位日）──────
+    m = re.match(r'^\d{4,6}[-_\s]+\d{1,2}[-_\s]+([A-Za-z0-9]{1,6})(?:[-_\s]|$)', name)
+    if m:
+        result = resolve_code(m.group(1))
+        if result:
+            return result
+
+    leading_candidate = None
+
+    # ── 格式 3：CODE + 分隔符（- _ 空格）+ 描述 ─────────
+    m = re.match(r'^([A-Za-z0-9]{1,6})[-_\s]+', name)
+    if m:
+        code_head = m.group(1)
+        code_head_upper = code_head.upper()
+        if code_head_upper not in NON_PRODUCER_PREFIX_CODES:
+            # 首段看起来就是人员代码时，优先返回（避免后段章节号如 4 抢中）
+            result = resolve_code(code_head, mapped_only=True)
+            if result:
+                return result
+            leading_candidate = resolve_code(code_head, mapped_only=False)
+            if leading_candidate:
+                return leading_candidate
+
+    # ── 格式 5：CODE直接接中文/非ASCII（无分隔符）────────
+    m = re.match(r'^([A-Za-z]{2,6})[^\x00-\x7F]', name)
+    if m:
+        head = m.group(1)
+        if head.upper() in NON_PRODUCER_PREFIX_CODES:
+            result = None
+        else:
+            result = resolve_code(head)
+        if result:
+            return result
+
+    # ── 兜底：按分隔符切段，从右向左找候选代码（避免把前缀国家码当制作人）────
+    # 例：US-AI-情绪--20241129-0019 - 副本 拷贝  -> 优先命中 0019
+    tokens = [t.strip() for t in re.split(r'[-_\s]+', name) if t.strip()]
+
+    # 第一轮：只返回“已映射”的命中
+    for tk in reversed(tokens):
+        if not re.match(r'^[A-Za-z0-9]{1,6}$', tk):
+            continue
+        if tk.upper() in NON_PRODUCER_PREFIX_CODES:
+            continue
+        # 跳过常见日期段
+        if re.match(r'^\d{8}$', tk):
+            continue
+        result = resolve_code(tk, mapped_only=True)
+        if result:
+            return result
+
+    # 第二轮：回退为未映射代码（从右向左）
+    for tk in reversed(tokens):
+        if not re.match(r'^[A-Za-z0-9]{1,6}$', tk):
+            continue
+        if tk.upper() in NON_PRODUCER_PREFIX_CODES:
+            continue
+        if re.match(r'^\d{8}$', tk):
+            continue
+        result = resolve_code(tk, mapped_only=False)
+        if result:
+            return result
+
+    if leading_candidate:
+        return leading_candidate
+
+    return '未知'
 
 
 def load_config():

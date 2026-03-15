@@ -284,6 +284,45 @@ class DBManager:
             )
         return rows
 
+    def _collect_derive_src_phashes(self, rows, out_set: set):
+        """从 derived_from/ancestors 结构中提取所有上游 src_phash。"""
+        for row in rows or []:
+            ph = row.get('src_phash')
+            if ph:
+                out_set.add(ph)
+            self._collect_derive_src_phashes(row.get('ancestors', []), out_set)
+
+    def _collect_compose_part_phashes(self, rows, out_set: set):
+        """从 composed_from/sub_parts 结构中提取组件 phash，并继续提取其祖先链。"""
+        for row in rows or []:
+            ph = row.get('part_phash')
+            if ph:
+                out_set.add(ph)
+            self._collect_derive_src_phashes(row.get('ancestors', []), out_set)
+            self._collect_compose_part_phashes(row.get('sub_parts', []), out_set)
+
+    def _build_canva_assets_lineage(self, phash_list):
+        """构建 Canva 模板素材列表，并附带每个素材的衍生/封装溯源。"""
+        if not self.conn:
+            return []
+        assets = []
+        for ph in phash_list or []:
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT phash, filename, asset_type, file_size, producer, created_at "
+                        "FROM assets WHERE phash = %s", (ph,)
+                    )
+                    asset = cur.fetchone()
+            except:
+                asset = None
+            if not asset:
+                continue
+            asset['ancestors'] = self._get_derive_chain_up(ph)
+            asset['composed_from'] = self._get_compose_tree(ph)
+            assets.append(asset)
+        return assets
+
     def get_lineage(self, phash):
         """返回完整溯源树 dict（含多级递归衍生链 + Canva 模板引用）"""
         if not self.conn:
@@ -327,6 +366,11 @@ class DBManager:
 
         result["composed_from"] = self._get_compose_tree(exact)
 
+        # Canva 关联匹配范围：当前素材 + 上游衍生 + 封装组件 + 组件祖先
+        canva_scope = {exact}
+        self._collect_derive_src_phashes(result["derived_from"], canva_scope)
+        self._collect_compose_part_phashes(result["composed_from"], canva_scope)
+
         with self.conn.cursor() as cur:
             # ── 被哪些成品使用 ────────────────────────────
             cur.execute("""
@@ -347,8 +391,23 @@ class DBManager:
                     phashes = json.loads(tmpl['asset_phashes']) if tmpl['asset_phashes'] else []
                 except:
                     phashes = []
-                if exact in phashes:
-                    result["canva_used"].append(tmpl)
+                phash_set = set(phashes)
+                if exact in phash_set:
+                    mode = 'direct'
+                    matched = [exact]
+                else:
+                    mode = 'upstream'
+                    matched = [ph for ph in phashes if ph in canva_scope]
+
+                if not matched:
+                    continue
+
+                t = dict(tmpl)
+                t['match_mode'] = mode
+                t['matched_phashes'] = matched
+                t['matched_count'] = len(matched)
+                t['assets'] = self._build_canva_assets_lineage(phashes)
+                result["canva_used"].append(t)
         return result
 
     def get_lineage_by_canva_id(self, template_id):
@@ -367,17 +426,7 @@ class DBManager:
             phash_list = json.loads(tmpl['asset_phashes']) if tmpl['asset_phashes'] else []
         except:
             phash_list = []
-        assets = []
-        for ph in phash_list:
-            with self.conn.cursor() as cur:
-                cur.execute(
-                    "SELECT phash, filename, asset_type, file_size, producer, created_at "
-                    "FROM assets WHERE phash = %s", (ph,)
-                )
-                asset = cur.fetchone()
-            if asset:
-                asset['ancestors'] = self._get_derive_chain_up(ph)
-                assets.append(asset)
+        assets = self._build_canva_assets_lineage(phash_list)
         return {"template": tmpl, "assets": assets}
 
     def _get_compose_tree(self, phash, visited=None, depth=0, max_depth=6):
