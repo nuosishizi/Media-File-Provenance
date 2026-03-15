@@ -5,6 +5,7 @@ import os
 import re
 import json
 import time
+import traceback
 import cv2
 import warnings
 warnings.filterwarnings('ignore')
@@ -51,6 +52,48 @@ def gui_log(msg): log_bus.sig.emit(msg)
 
 # ── 数据库单例 ───────────────────────────────────────
 db = DBManager()
+
+
+def _diag_log_file() -> str:
+    if sys.platform.startswith('win'):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        log_dir = os.path.join(base, 'MAMDesktop', 'logs')
+    elif sys.platform == 'darwin':
+        log_dir = os.path.join(os.path.expanduser('~'), 'Library', 'Logs', 'MAMDesktop')
+    else:
+        log_dir = os.path.join(os.path.expanduser('~'), '.mamdesktop', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"mam_gui_{datetime.now().strftime('%Y%m%d')}.log")
+
+
+DIAG_LOG_FILE = _diag_log_file()
+
+
+def _append_diag_log(message: str, detail: str = ""):
+    try:
+        os.makedirs(os.path.dirname(DIAG_LOG_FILE), exist_ok=True)
+        with open(DIAG_LOG_FILE, 'a', encoding='utf-8') as f:
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"[{ts}] {message}\n")
+            if detail:
+                f.write(detail.rstrip() + "\n")
+    except:
+        pass
+
+
+def _install_exception_hook():
+    def _hook(exc_type, exc_value, exc_tb):
+        tb = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        _append_diag_log("未捕获异常", tb)
+        try:
+            QMessageBox.critical(
+                None,
+                "程序异常",
+                f"程序发生未捕获异常：{exc_value}\n\n诊断日志：{DIAG_LOG_FILE}"
+            )
+        except:
+            pass
+    sys.excepthook = _hook
 
 # ─────────────────────────────────────────────────────
 # 辅助：确保素材已在库中（自动登记）
@@ -457,8 +500,11 @@ class Worker(QThread):
     progress = pyqtSignal(int)  # 0-100
     def __init__(self, fn): super().__init__(); self._fn = fn
     def run(self):
-        try:   self.done.emit(self._fn())
-        except Exception as e: self.error.emit(str(e))
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:
+            _append_diag_log("后台任务异常", traceback.format_exc())
+            self.error.emit(str(e))
 
 # ─────────────────────────────────────────────────────
 # 主窗口
@@ -476,6 +522,7 @@ class MamApp(QMainWindow):
         self._code_table_dirty = False
         self._build_ui()
         log_bus.sig.connect(self._log)
+        self._log(f"🧭 诊断日志: {DIAG_LOG_FILE}")
         ok, msg = db.connect()
         self._log("✅ 数据库连接成功" if ok else f"⚠️ 数据库: {msg}")
         # exiftool 状态
@@ -1135,6 +1182,7 @@ class MamApp(QMainWindow):
 
     def _log(self, msg):
         self._log_box.append(f"[{datetime.now().strftime('%H:%M:%S')}]  {msg}")
+        _append_diag_log(msg)
 
     # ═══════════════════ 业务处理 ═════════════════════
     def _do_register(self):
@@ -2610,13 +2658,48 @@ class MamApp(QMainWindow):
                                 QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(d.accept); btns.rejected.connect(d.reject); lay.addRow(btns)
         if d.exec():
-            self._cfg['user_name'] = fn.text(); save_config(self._cfg)
-            db.conf.update({'host': fh.text(), 'port': int(fp.text() or 3306),
-                            'user': fu.text(), 'password': fw.text(), 'db': fd.text()})
-            db.save_conf(db.conf)
-            ok, msg = db.connect()
-            self._lbl_user.setText(f"操作员 · {self._cfg['user_name']}")
-            self._log("✅ 设置保存，数据库重连" + ("成功" if ok else f"失败: {msg}"))
+            try:
+                user_name = (fn.text() or '').strip() or self._cfg.get('user_name', '操作员')
+                port_text = (fp.text() or '').strip()
+                port = int(port_text or '3306')
+                if port <= 0 or port > 65535:
+                    raise ValueError("端口必须在 1-65535 之间")
+
+                host = (fh.text() or '').strip()
+                user = (fu.text() or '').strip()
+                db_name = (fd.text() or '').strip()
+                pwd = fw.text()
+
+                self._cfg['user_name'] = user_name
+                save_config(self._cfg)
+
+                db.conf.update({
+                    'host': host,
+                    'port': port,
+                    'user': user,
+                    'password': pwd,
+                    'db': db_name,
+                })
+                db.save_conf(db.conf)
+
+                self._log(f"⚙️ 尝试重连数据库: host={host}, port={port}, user={user}, db={db_name}")
+                ok, msg = db.connect()
+                self._lbl_user.setText(f"操作员 · {self._cfg['user_name']}")
+                self._log("✅ 设置保存，数据库重连" + ("成功" if ok else f"失败: {msg}"))
+                if not ok:
+                    QMessageBox.warning(
+                        self,
+                        "数据库连接失败",
+                        f"连接失败：{msg}\n\n请查看诊断日志：{DIAG_LOG_FILE}"
+                    )
+            except Exception as e:
+                _append_diag_log("系统设置保存异常", traceback.format_exc())
+                self._log(f"❌ 设置保存失败: {e}")
+                QMessageBox.critical(
+                    self,
+                    "设置保存失败",
+                    f"错误：{e}\n\n请查看诊断日志：{DIAG_LOG_FILE}"
+                )
 
 
     # ── Tab7：批量扫描 ─────────────────────────────────
@@ -3157,8 +3240,10 @@ class MamApp(QMainWindow):
 
 
 if __name__ == "__main__":
-    app = QApplication.instance() or QApplication(sys.argv)
-    app.setStyleSheet("""
+    _install_exception_hook()
+    try:
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setStyleSheet("""
 QWidget {
     font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei UI", sans-serif;
     font-size: 13px;
@@ -3329,5 +3414,16 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {
     color: #dce6f0;
 }
 """)
-    win = MamApp(); win.show()
-    sys.exit(app.exec())
+        win = MamApp(); win.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        _append_diag_log("程序启动失败", traceback.format_exc())
+        try:
+            QMessageBox.critical(
+                None,
+                "启动失败",
+                f"程序启动失败：{e}\n\n请查看诊断日志：{DIAG_LOG_FILE}"
+            )
+        except:
+            pass
+        raise

@@ -1,12 +1,29 @@
 # mam_db.py — 数据库管理（MySQL）
 # 列名使用 metadata_json 兼容旧表；关系表不使用外键，避免 charset 不兼容
 import os
+import sys
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-DB_CONFIG_FILE = "mam_db_config.json"
+def _app_data_dir() -> str:
+    if sys.platform.startswith('win'):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        path = os.path.join(base, 'MAMDesktop')
+    elif sys.platform == 'darwin':
+        path = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'MAMDesktop')
+    else:
+        path = os.path.join(os.path.expanduser('~'), '.mamdesktop')
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+LEGACY_DB_CONFIG_FILE = "mam_db_config.json"
+DB_CONFIG_FILE = os.path.join(_app_data_dir(), LEGACY_DB_CONFIG_FILE)
 
 try:
     import pymysql
@@ -30,16 +47,18 @@ class DBManager:
         self._producer_codes_cache = None  # 缓存产生者代码
 
     def _load_conf(self):
-        if os.path.exists(DB_CONFIG_FILE):
-            try:
-                return json.load(open(DB_CONFIG_FILE, 'r', encoding='utf-8'))
-            except:
-                pass
+        for p in (DB_CONFIG_FILE, LEGACY_DB_CONFIG_FILE):
+            if os.path.exists(p):
+                try:
+                    return json.load(open(p, 'r', encoding='utf-8'))
+                except:
+                    pass
         return {"host": "localhost", "user": "root",
                 "password": "", "db": "mam_system", "port": 3306}
 
     def save_conf(self, conf):
         self.conf = conf
+        os.makedirs(os.path.dirname(DB_CONFIG_FILE), exist_ok=True)
         json.dump(conf, open(DB_CONFIG_FILE, 'w', encoding='utf-8'), indent=2)
 
     def connect(self, init_tables=True, warm_cache=True):

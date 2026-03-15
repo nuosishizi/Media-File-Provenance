@@ -1,5 +1,6 @@
 # mam_core.py — 核心算法 & 文件工具
 import os
+import sys
 import re
 import json
 import numpy as np
@@ -11,9 +12,28 @@ IMG_EXTS = ('.png', '.jpg', '.jpeg', '.webp')
 VID_EXTS = ('.mp4', '.mov', '.avi', '.mkv', '.webm')
 ALL_EXTS  = IMG_EXTS + VID_EXTS
 
-CONFIG_FILE       = "mam_config.json"
-DB_CONFIG_FILE    = "mam_db_config.json"
-PRODUCER_CODE_FILE = "mam_producer_codes.json"
+def _app_data_dir() -> str:
+    if sys.platform.startswith('win'):
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        path = os.path.join(base, 'MAMDesktop')
+    elif sys.platform == 'darwin':
+        path = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'MAMDesktop')
+    else:
+        path = os.path.join(os.path.expanduser('~'), '.mamdesktop')
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+LEGACY_CONFIG_FILE = "mam_config.json"
+LEGACY_DB_CONFIG_FILE = "mam_db_config.json"
+LEGACY_PRODUCER_CODE_FILE = "mam_producer_codes.json"
+
+CONFIG_FILE = os.path.join(_app_data_dir(), LEGACY_CONFIG_FILE)
+DB_CONFIG_FILE = os.path.join(_app_data_dir(), LEGACY_DB_CONFIG_FILE)
+PRODUCER_CODE_FILE = os.path.join(_app_data_dir(), LEGACY_PRODUCER_CODE_FILE)
 
 # 这些前缀常用于国家/来源标记，不应当作人员代码。
 # 如有误判，可按需继续补充（统一大写）。
@@ -23,16 +43,18 @@ NON_PRODUCER_PREFIX_CODES = {"US"}
 # ── 人员代码表 ────────────────────────────────────────────────
 def load_producer_codes() -> dict:
     """载入人员代码表，格式: {"KS": "张三", "57": "李四"}"""
-    if os.path.exists(PRODUCER_CODE_FILE):
-        try:
-            with open(PRODUCER_CODE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
+    for p in (PRODUCER_CODE_FILE, LEGACY_PRODUCER_CODE_FILE):
+        if os.path.exists(p):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                pass
     return {}
 
 
 def save_producer_codes(codes: dict):
+    os.makedirs(os.path.dirname(PRODUCER_CODE_FILE), exist_ok=True)
     with open(PRODUCER_CODE_FILE, 'w', encoding='utf-8') as f:
         json.dump(codes, f, ensure_ascii=False, indent=2)
 
@@ -168,16 +190,18 @@ def parse_producer_from_filename(filename: str, code_map: dict) -> str:
 
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
+    for p in (CONFIG_FILE, LEGACY_CONFIG_FILE):
+        if os.path.exists(p):
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                pass
     return {"user_name": "操作员", "user_id": "001"}
 
 
 def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
