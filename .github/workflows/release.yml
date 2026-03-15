@@ -48,9 +48,57 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install exiftool -y --no-progress
-          $cmd = Get-Command exiftool.exe -ErrorAction Stop
-          "EXIFTOOL_PATH=$($cmd.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Try to use local exiftool.exe if available
+          if (Test-Path "exiftool.exe") {
+            $exiftoolPath = "$(Get-Item exiftool.exe | Select-Object -ExpandProperty FullName)"
+            Write-Host "Using local exiftool: $exiftoolPath"
+          } else {
+            Write-Host "Local exiftool not found, installing via Chocolatey..."
+            choco install exiftool -y --no-progress
+            
+            # Wait a moment for the installation to complete
+            Start-Sleep -Seconds 2
+            
+            # Try multiple methods to find exiftool
+            $exiftoolPath = $null
+            
+            # Method 1: Get-Command
+            try {
+              $cmd = Get-Command exiftool.exe -ErrorAction SilentlyContinue
+              if ($cmd) {
+                $exiftoolPath = $cmd.Source
+                Write-Host "Found exiftool via Get-Command: $exiftoolPath"
+              }
+            } catch {}
+            
+            # Method 2: Check common Chocolatey install location
+            if (-not $exiftoolPath) {
+              $chocoPath = "C:\ProgramData\chocolatey\bin\exiftool.exe"
+              if (Test-Path $chocoPath) {
+                $exiftoolPath = $chocoPath
+                Write-Host "Found exiftool in Chocolatey path: $exiftoolPath"
+              }
+            }
+            
+            # Method 3: Check Program Files
+            if (-not $exiftoolPath) {
+              $progPath = Get-ChildItem -Path "C:\Program Files*" -Filter "exiftool.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
+              if ($progPath) {
+                $exiftoolPath = $progPath
+                Write-Host "Found exiftool in Program Files: $exiftoolPath"
+              }
+            }
+            
+            # If still not found, use fallback
+            if (-not $exiftoolPath) {
+              Write-Host "WARNING: Could not find exiftool, will use fallback method"
+              $exiftoolPath = "exiftool.exe"
+            }
+          }
+          
+          # Set environment variable
+          "EXIFTOOL_PATH=$exiftoolPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "EXIFTOOL_PATH set to: $exiftoolPath"
 
       - name: Install exiftool on macOS
         if: runner.os == 'macOS'
@@ -63,22 +111,64 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --name MAMDesktop `
-            --collect-all PyQt6 `
-            --collect-all cv2 `
-            --collect-all imagehash `
-            --hidden-import pymysql `
-            --hidden-import piexif `
-            --hidden-import mutagen.mp4 `
-            --add-binary "$env:EXIFTOOL_PATH;." `
-            mam_gui.py
+          Write-Host "EXIFTOOL_PATH from env: $env:EXIFTOOL_PATH"
+          Write-Host "Current directory: $(Get-Location)"
+          
+          # Verify Python and PyInstaller are available
+          python --version
+          python -m PyInstaller --version
+          
+          # Run PyInstaller with proper error handling
+          $pyinstallerCmd = @(
+            "python",
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--windowed",
+            "--name=MAMDesktop",
+            "--collect-all=PyQt6",
+            "--collect-all=cv2",
+            "--collect-all=imagehash",
+            "--hidden-import=pymysql",
+            "--hidden-import=piexif",
+            "--hidden-import=mutagen.mp4"
+          )
+          
+          # Add exiftool binary if available
+          if ($env:EXIFTOOL_PATH -and (Test-Path $env:EXIFTOOL_PATH)) {
+            $pyinstallerCmd += "--add-binary=$($env:EXIFTOOL_PATH);."
+            Write-Host "Adding exiftool: $($env:EXIFTOOL_PATH)"
+          } else {
+            Write-Host "WARNING: EXIFTOOL_PATH not set or file not found, skipping exiftool binary"
+          }
+          
+          $pyinstallerCmd += "mam_gui.py"
+          
+          # Run PyInstaller
+          & $pyinstallerCmd[0] @($pyinstallerCmd | Select-Object -Skip 1)
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "✗ ERROR: PyInstaller failed with exit code $LASTEXITCODE"
+            exit 1
+          }
           
           Write-Host "Checking PyInstaller output..."
           if (Test-Path "dist\MAMDesktop") {
             Write-Host "✓ dist\MAMDesktop exists"
-            Get-ChildItem -Path "dist\MAMDesktop" -Recurse | Measure-Object | ForEach-Object { Write-Host "  Files count: $($_.Count)" }
+            $fileCount = (Get-ChildItem -Path "dist\MAMDesktop" -Recurse | Measure-Object).Count
+            Write-Host "  Files count: $fileCount"
+            
+            # Verify exe exists
+            if (Test-Path "dist\MAMDesktop\MAMDesktop.exe") {
+              Write-Host "✓ dist\MAMDesktop\MAMDesktop.exe exists"
+            } else {
+              Write-Host "✗ ERROR: MAMDesktop.exe not found!"
+              exit 1
+            }
           } else {
             Write-Host "✗ ERROR: dist\MAMDesktop not found!"
+            Write-Host "Directory listing:"
             Get-ChildItem -Path "dist" -ErrorAction Ignore | ForEach-Object { Write-Host "  Found: $_" }
             exit 1
           }
