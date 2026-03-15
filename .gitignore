@@ -30,5 +30,28 @@ exiftool(-k).exe
 *.bkp
 .$*.bkp
 
+# 调试/补丁临时文件
+_convert*.py
+_patch*.py
+patch*.py
+patch_chunk*.py
+patch_derive.py
+app_run.txt
+ast_dump.txt
+bisect.txt
+err.txt
+filtered.txt
+force_app.txt
+init_trace.txt
+last50.txt
+out.txt
+out2.txt
+tb.txt
+tb2.txt
+tb3.txt
+test_*.txt
+trace.txt
+trace2.txt
+
 # VS Code
 .vscode/
