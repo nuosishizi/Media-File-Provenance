@@ -62,23 +62,54 @@ jobs:
           brew install exiftool
           echo "EXIFTOOL_PATH=$(command -v exiftool)" >> "$GITHUB_ENV"
 
+      - name: Prepare app icon on macOS
+        if: runner.os == 'macOS'
+        run: |
+          if [ -f "ico.ico" ]; then
+            python -c "from PIL import Image; Image.open('ico.ico').save('ico.icns'); print('Converted ico.ico -> ico.icns')"
+          fi
+
       - name: Build app on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --name MAMDesktop `
-            --collect-all PyQt6 `
-            --collect-all cv2 `
-            --collect-all imagehash `
-            --hidden-import pymysql `
-            --hidden-import piexif `
-            --hidden-import mutagen.mp4 `
-            --add-binary "$env:EXIFTOOL_PATH;." `
-            mam_gui.py
+          $cmd = @(
+            "pyinstaller",
+            "--noconfirm",
+            "--clean",
+            "--windowed",
+            "--name", "MAMDesktop",
+            "--collect-all", "PyQt6",
+            "--collect-all", "cv2",
+            "--collect-all", "imagehash",
+            "--hidden-import", "pymysql",
+            "--hidden-import", "piexif",
+            "--hidden-import", "mutagen.mp4"
+          )
+
+          if (Test-Path "ico.ico") {
+            $cmd += @("--icon", "ico.ico")
+            $cmd += @("--add-data", "ico.ico;.")
+            Write-Host "Using app icon: ico.ico"
+          } else {
+            Write-Host "WARNING: ico.ico not found, building without custom icon"
+          }
+
+          $cmd += @("--add-binary", "$env:EXIFTOOL_PATH;.", "mam_gui.py")
+          & $cmd[0] @($cmd | Select-Object -Skip 1)
 
       - name: Build app on macOS
         if: runner.os == 'macOS'
         run: |
+          ICON_ARGS=()
+          if [ -f "ico.icns" ]; then
+            ICON_ARGS+=(--icon "ico.icns")
+            echo "Using app icon: ico.icns"
+          elif [ -f "ico.ico" ]; then
+            ICON_ARGS+=(--add-data "ico.ico:.")
+            echo "No .icns found, packaging ico.ico as data"
+          fi
+
           pyinstaller --noconfirm --clean --windowed --name MAMDesktop \
             --collect-all PyQt6 \
             --collect-all cv2 \
@@ -86,6 +117,7 @@ jobs:
             --hidden-import pymysql \
             --hidden-import piexif \
             --hidden-import mutagen.mp4 \
+            "${ICON_ARGS[@]}" \
             --add-binary "${EXIFTOOL_PATH}:." \
             mam_gui.py
 
@@ -110,12 +142,15 @@ jobs:
             'ArchitecturesAllowed=x64compatible',
             'ArchitecturesInstallIn64BitMode=x64compatible',
             'WizardStyle=modern',
+            'SetupIconFile=..\..\ico.ico',
+            'UninstallDisplayIcon={app}\MAMDesktop.exe',
             '',
             '[Tasks]',
             'Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons"',
             '',
             '[Files]',
             'Source: "..\..\dist\MAMDesktop\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs',
+            'Source: "..\..\ico.ico"; DestDir: "{app}"; Flags: ignoreversion',
             'Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion',
             'Source: "..\..\QUICK_START.md"; DestDir: "{app}"; Flags: ignoreversion',
             'Source: "..\..\API_REFERENCE.md"; DestDir: "{app}"; Flags: ignoreversion',

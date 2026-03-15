@@ -4,6 +4,7 @@ import sys
 import os
 import re
 import json
+import time
 import cv2
 import warnings
 warnings.filterwarnings('ignore')
@@ -307,7 +308,9 @@ class ScanWorker(QThread):
         atype = get_asset_type(fp)
         fsize = get_file_size(fp)
         now = datetime.now()
-        producer = parse_producer_from_filename(fname, self._code_map) or self._operator
+        producer = parse_producer_from_filename(fname, self._code_map)
+        if not producer:
+            producer = "未知"
         rec = {
             "phash": ph,
             "filename": fname,
@@ -1084,8 +1087,15 @@ class MamApp(QMainWindow):
         sr = QHBoxLayout()
         self._search_box = LineEdit(); self._search_box.setPlaceholderText("搜索文件名 / 作者…")
         self._search_box.textChanged.connect(self._filter_lib)
+        btn_fix = PushButton("🛠 修正错误")
+        btn_fix.setStyleSheet(
+            "background:#c0392b;color:#fff;height:34px;font-size:12px;"
+            "border:none;border-radius:7px;padding:0 12px;"
+        )
+        btn_fix.setToolTip("按条件批量修正作者名（需密码验证）")
+        btn_fix.clicked.connect(self._fix_wrong_producer_with_password)
         btn = PushButton("🔄 刷新"); btn.clicked.connect(self._refresh_lib)
-        sr.addWidget(self._search_box); sr.addWidget(btn); v.addLayout(sr)
+        sr.addWidget(self._search_box); sr.addWidget(btn_fix); sr.addWidget(btn); v.addLayout(sr)
         self._tbl_lib = TableWidget(0, 6)
         self._tbl_lib.setHorizontalHeaderLabels(["文件名","类型","作者","时间","大小","pHash前16位"])
         self._tbl_lib.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -1131,9 +1141,17 @@ class MamApp(QMainWindow):
         fps = self._drop_raw.files()
         if not fps: QMessageBox.warning(self, "提示", "请先拖入素材文件"); return
         op = self._cfg['user_name']
-        code_map = self._get_code_map()   # 在主线程读取，供后台任务使用
         def task():
             total = len(fps)
+            upload_batch = 120
+            upload_buffer = []
+
+            def flush_assets():
+                if not upload_buffer:
+                    return
+                db.upsert_assets_bulk(list(upload_buffer))
+                upload_buffer.clear()
+
             for idx, fp in enumerate(fps):
                 img = get_thumbnail(fp)
                 if img is None: gui_log(f"⚠️ 无法读取: {os.path.basename(fp)}"); continue
@@ -1141,10 +1159,11 @@ class MamApp(QMainWindow):
                 if not ph: gui_log(f"❌ phash计算失败: {os.path.basename(fp)}"); continue
                 fname = os.path.basename(fp); atype = get_asset_type(fp)
                 fsize = get_file_size(fp); now = datetime.now()
-                # 优先从文件名前缀码识别制作人（补充登记时能正确归属）
-                producer = parse_producer_from_filename(fname, code_map) or op
                 # 如已有元数据，可读取文件中已写入的 created_at，避免覆盖
                 existing_meta = read_metadata(fp) or {}
+                producer = (existing_meta.get('producer') or '').strip()
+                if not producer:
+                    producer = op
                 created_at = now
                 if existing_meta.get('created_at'):
                     try:
@@ -1156,14 +1175,19 @@ class MamApp(QMainWindow):
                        "file_size": fsize, "producer": producer,
                        "created_at": created_at.isoformat()}
                 write_metadata(fp, rec)
-                db.upsert_asset(ph, fname, atype, fsize, producer, created_at,
-                                json.dumps(rec, ensure_ascii=False, default=str),
-                                make_thumb_bytes(img))
-                src_tag = "（从文件名识别）" if producer != op else ""
+                upload_buffer.append((
+                    ph, fname, atype, fsize, producer, created_at,
+                    json.dumps(rec, ensure_ascii=False, default=str),
+                    make_thumb_bytes(img)
+                ))
+                if len(upload_buffer) >= upload_batch:
+                    flush_assets()
+                src_tag = "（保留原元数据）" if existing_meta.get('producer') else ""
                 gui_log(f"✅ 已登记: {fname}  作者:{producer}{src_tag}  phash:{ph}")
                 # 报告进度
                 progress_percent = int((idx + 1) / total * 100)
                 self.report_progress(progress_percent)
+            flush_assets()
             return {}
         self._bg(task, msg="素材登记")
 
@@ -1343,11 +1367,19 @@ class MamApp(QMainWindow):
 
     def _run_compose_jobs(self, jobs: list, op: str):
         cache = {}
+        upsert_buffer = []
+        upload_batch = 120
 
         def ensure_once(fp):
             if fp not in cache:
                 cache[fp] = ensure_registered(fp, op)
             return cache[fp]
+
+        def flush_assets():
+            if not upsert_buffer:
+                return
+            db.upsert_assets_bulk(list(upsert_buffer))
+            upsert_buffer.clear()
 
         done_folders = 0
         ok_products = 0
@@ -1404,7 +1436,7 @@ class MamApp(QMainWindow):
                     "batch_folder": folder_name,
                 })
                 write_metadata(pfp, rec)
-                db.upsert_asset(
+                upsert_buffer.append((
                     ph_product,
                     os.path.basename(pfp),
                     get_asset_type(pfp),
@@ -1412,13 +1444,18 @@ class MamApp(QMainWindow):
                     op,
                     datetime.now(),
                     json.dumps(rec, ensure_ascii=False, default=str),
-                )
+                    None,
+                ))
+                if len(upsert_buffer) >= upload_batch:
+                    flush_assets()
                 ok_products += 1
                 gui_log(
                     f"  ✅ 成品登记: [{op}]{os.path.basename(pfp)}  关联组件 {len(payload)} 个"
                 )
 
             done_folders += 1
+
+        flush_assets()
 
         return {
             "folders": done_folders,
@@ -1656,13 +1693,13 @@ class MamApp(QMainWindow):
                 no_id.append(fd)
                 continue
 
-            lineage = db.get_lineage_by_canva_id(tid)
-            if not lineage:
+            template_pack = db.get_canva_template_assets_basic(tid)
+            if not template_pack:
                 no_template.append((fd, tid))
                 continue
 
-            tmpl = lineage.get('template', {})
-            assets = lineage.get('assets', [])
+            tmpl = template_pack.get('template', {})
+            assets = template_pack.get('assets', [])
             src_infos = []
             src_phashes = []
             for a in assets:
@@ -1710,6 +1747,14 @@ class MamApp(QMainWindow):
 
         def task():
             cache = {}
+            upsert_buffer = []
+            upload_batch = 120
+
+            def flush_assets():
+                if not upsert_buffer:
+                    return
+                db.upsert_assets_bulk(list(upsert_buffer))
+                upsert_buffer.clear()
 
             def ensure_once(fp):
                 if fp not in cache:
@@ -1763,7 +1808,7 @@ class MamApp(QMainWindow):
                         "composed_from": [dict(x) for x in source_payload],
                     })
                     write_metadata(fp, rec)
-                    db.upsert_asset(
+                    upsert_buffer.append((
                         ph,
                         os.path.basename(fp),
                         get_asset_type(fp),
@@ -1771,7 +1816,10 @@ class MamApp(QMainWindow):
                         op,
                         datetime.now(),
                         json.dumps(rec, ensure_ascii=False, default=str),
-                    )
+                        None,
+                    ))
+                    if len(upsert_buffer) >= upload_batch:
+                        flush_assets()
                     ok_files += 1
                     gui_log(
                         f"  ✅ Canva关联: [{op}]{os.path.basename(fp)}"
@@ -1779,6 +1827,8 @@ class MamApp(QMainWindow):
                     )
 
                 done_folders += 1
+
+            flush_assets()
 
             return {
                 "folders": done_folders,
@@ -2228,6 +2278,8 @@ class MamApp(QMainWindow):
         save_config(self._cfg)
 
         def task():
+            t0 = time.perf_counter()
+
             # 阶段1：并发计算“文件内容哈希”（不再依赖文件名猜测）
             hashed_rows = []
 
@@ -2253,15 +2305,23 @@ class MamApp(QMainWindow):
                     hashed_rows.append(row)
                     self.report_progress(int(done_count / max(total, 1) * 40))
 
+            t_hash = time.perf_counter()
+            gui_log(f"⏱️ 查询阶段1/3 哈希计算: {t_hash - t0:.2f}s（文件 {len(hashed_rows)}）")
+
             # 阶段2：SQL 批量溯源查询
             ph_list = [r['phash'] for r in hashed_rows if r.get('phash')]
             lineage_map = {}
             if ph_list:
+                t_db_conn_start = time.perf_counter()
                 query_db = DBManager()
                 query_db.conf = dict(db.conf)
-                ok, msg = query_db.connect()
+                ok, msg = query_db.connect(init_tables=False, warm_cache=False)
                 if not ok:
                     raise RuntimeError(msg)
+                t_db_conn_end = time.perf_counter()
+                gui_log(f"⏱️ SQL连接耗时: {t_db_conn_end - t_db_conn_start:.2f}s")
+
+                t_db_query_start = time.perf_counter()
                 try:
                     lineage_map = query_db.get_lineage_batch(
                         ph_list,
@@ -2270,6 +2330,14 @@ class MamApp(QMainWindow):
                     )
                 finally:
                     query_db.close()
+                t_db_query_end = time.perf_counter()
+                gui_log(f"⏱️ SQL批量溯源耗时: {t_db_query_end - t_db_query_start:.2f}s")
+
+            t_db = time.perf_counter()
+            gui_log(
+                f"⏱️ 查询阶段2/3 SQL溯源: {t_db - t_hash:.2f}s"
+                f"（有效哈希 {len(ph_list)}，命中 {sum(1 for v in lineage_map.values() if v)}）"
+            )
 
             # 阶段3：组装返回
             results = []
@@ -2279,6 +2347,11 @@ class MamApp(QMainWindow):
                 lineage = lineage_map.get(ph) if ph else None
                 results.append({'fp': row['fp'], 'img': row['img'], 'lineage': lineage})
                 self.report_progress(40 + int((i + 1) / total * 60))
+
+            t_end = time.perf_counter()
+            gui_log(
+                f"⏱️ 查询阶段3/3 结果组装: {t_end - t_db:.2f}s；总耗时: {t_end - t0:.2f}s"
+            )
 
             return results
 
@@ -2422,6 +2495,103 @@ class MamApp(QMainWindow):
         self._fill_lib([r for r in self._lib_data
                         if kw in (r.get('filename') or '').lower()
                         or kw in (r.get('producer') or '').lower()])
+
+    def _fix_wrong_producer_with_password(self):
+        if not db.conn:
+            QMessageBox.warning(self, "提示", "数据库未连接，请先在【系统设置】中连接")
+            return
+
+        d = QDialog(self)
+        d.setWindowTitle("修正错误作者")
+        d.setMinimumWidth(460)
+        lay = QFormLayout(d)
+
+        old_name = QLineEdit()
+        old_name.setPlaceholderText("错误作者名（必填）")
+        new_name = QLineEdit()
+        new_name.setPlaceholderText("修正为（必填）")
+        keyword = QLineEdit()
+        keyword.setPlaceholderText("文件名包含（可选）")
+        start_day = QLineEdit()
+        start_day.setPlaceholderText("开始日期 YYYY-MM-DD（可选）")
+        end_day = QLineEdit()
+        end_day.setPlaceholderText("结束日期 YYYY-MM-DD（可选）")
+        password = QLineEdit()
+        password.setEchoMode(QLineEdit.EchoMode.Password)
+        password.setPlaceholderText("请输入执行密码")
+
+        lay.addRow("错误作者：", old_name)
+        lay.addRow("修正为：", new_name)
+        lay.addRow("文件名条件：", keyword)
+        lay.addRow("开始日期：", start_day)
+        lay.addRow("结束日期：", end_day)
+        lay.addRow("验证密码：", password)
+
+        tip = QLabel("仅在密码正确时执行。密码：xiugai2026")
+        tip.setStyleSheet("color:#8a6d1f;font-size:12px;")
+        lay.addRow("", tip)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        lay.addRow(btns)
+        btns.accepted.connect(d.accept)
+        btns.rejected.connect(d.reject)
+
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        old_val = old_name.text().strip()
+        new_val = new_name.text().strip()
+        key_val = keyword.text().strip()
+        start_val = start_day.text().strip()
+        end_val = end_day.text().strip()
+        pwd_val = password.text().strip()
+
+        if pwd_val != "xiugai2026":
+            QMessageBox.warning(self, "验证失败", "密码错误，已取消执行")
+            self._log("⛔ 修正错误已拦截：密码错误")
+            return
+
+        if not old_val or not new_val:
+            QMessageBox.warning(self, "提示", "错误作者和修正作者不能为空")
+            return
+
+        if old_val == new_val:
+            QMessageBox.warning(self, "提示", "错误作者和修正作者相同，无需执行")
+            return
+
+        for txt, field_name in ((start_val, "开始日期"), (end_val, "结束日期")):
+            if txt:
+                try:
+                    datetime.strptime(txt, "%Y-%m-%d")
+                except Exception:
+                    QMessageBox.warning(self, "提示", f"{field_name}格式应为 YYYY-MM-DD")
+                    return
+
+        if start_val and end_val and start_val > end_val:
+            QMessageBox.warning(self, "提示", "开始日期不能晚于结束日期")
+            return
+
+        def task():
+            return db.fix_wrong_producer(
+                old_producer=old_val,
+                new_producer=new_val,
+                filename_keyword=key_val,
+                start_date=start_val or None,
+                end_date=end_val or None,
+            )
+
+        def done(affected):
+            self._refresh_lib()
+            summary = (
+                f"修正完成：把作者【{old_val}】改为【{new_val}】，"
+                f"共影响 {affected} 条"
+            )
+            self._log(f"✅ {summary}")
+            QMessageBox.information(self, "修正错误", summary)
+
+        self._bg(task, done, msg="修正错误作者")
 
     # ═══════════════════ 设置 ═════════════════════════
     def _dlg_settings(self):

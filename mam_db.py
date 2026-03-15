@@ -42,7 +42,7 @@ class DBManager:
         self.conf = conf
         json.dump(conf, open(DB_CONFIG_FILE, 'w', encoding='utf-8'), indent=2)
 
-    def connect(self):
+    def connect(self, init_tables=True, warm_cache=True):
         if not MYSQL_OK:
             return False, "未安装 pymysql，请运行: pip install pymysql"
         try:
@@ -52,9 +52,11 @@ class DBManager:
                 port=int(self.conf['port']), charset='utf8mb4',
                 cursorclass=pymysql.cursors.DictCursor, autocommit=True
             )
-            self._init_tables()
-            # 连接成功后立即初始化缓存
-            self._refresh_cache()
+            if init_tables:
+                self._init_tables()
+            # 仅在需要时预热缓存，避免轻量查询连接触发全量扫描
+            if warm_cache:
+                self._refresh_cache()
             return True, "连接成功"
         except Exception as e:
             return False, str(e)
@@ -244,14 +246,19 @@ class DBManager:
     def add_compose(self, part_phashes, product_phash, roles=None):
         if not self.conn:
             return
+        if not part_phashes:
+            return
+        now = datetime.now()
+        rows = []
+        for i, ph in enumerate(part_phashes):
+            role = roles[i] if roles and i < len(roles) else "component"
+            rows.append((ph, product_phash, i, role, now))
         with self.conn.cursor() as cur:
-            for i, ph in enumerate(part_phashes):
-                role = roles[i] if roles and i < len(roles) else "component"
-                cur.execute("""
-                    INSERT INTO rel_compose
-                        (part_phash, product_phash, part_order, part_role, created_at)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (ph, product_phash, i, role, datetime.now()))
+            cur.executemany("""
+                INSERT INTO rel_compose
+                    (part_phash, product_phash, part_order, part_role, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+            """, rows)
         self._phash_cache = None  # 清空缓存，触发下次刷新
 
     # ── 缓存管理 ────────────────────────────────────────
@@ -365,6 +372,39 @@ class DBManager:
             out[r['phash']] = r
         return out
 
+    def _get_cached_derive_up(self, phash, local_cache=None):
+        """读取并缓存某个 phash 的向上衍生链。"""
+        if not phash:
+            return []
+        if local_cache is None:
+            return self._get_derive_chain_up(phash)
+        cache = local_cache.setdefault('derive_up', {})
+        if phash not in cache:
+            cache[phash] = self._get_derive_chain_up(phash)
+        return cache[phash]
+
+    def _get_cached_derive_down(self, phash, local_cache=None):
+        """读取并缓存某个 phash 的向下衍生链。"""
+        if not phash:
+            return []
+        if local_cache is None:
+            return self._get_derive_chain_down(phash)
+        cache = local_cache.setdefault('derive_down', {})
+        if phash not in cache:
+            cache[phash] = self._get_derive_chain_down(phash)
+        return cache[phash]
+
+    def _get_cached_compose(self, phash, local_cache=None):
+        """读取并缓存某个 phash 的封装组件树。"""
+        if not phash:
+            return []
+        if local_cache is None:
+            return self._get_compose_tree(phash)
+        cache = local_cache.setdefault('compose', {})
+        if phash not in cache:
+            cache[phash] = self._get_compose_tree(phash, local_cache=local_cache)
+        return cache[phash]
+
     # ── 递归溯源链（优化：避免 visited.copy() 副本）──────────────────────────────────────
     def _get_derive_chain_up(self, phash, visited=None, depth=0, max_depth=8):
         """递归向上：此 phash 是从哪些素材衍生而来（返回带 ancestors 键的行列表）"""
@@ -435,26 +475,40 @@ class DBManager:
             self._collect_derive_src_phashes(row.get('ancestors', []), out_set)
             self._collect_compose_part_phashes(row.get('sub_parts', []), out_set)
 
-    def _build_canva_assets_lineage(self, phash_list):
+    def _build_canva_assets_lineage(self, phash_list, local_cache=None,
+                                    template_assets_cache=None, template_cache_lock=None):
         """构建 Canva 模板素材列表，并附带每个素材的衍生/封装溯源。"""
         if not self.conn:
             return []
+
+        cache_key = tuple(phash_list or [])
+        if template_assets_cache is not None:
+            if template_cache_lock is not None:
+                with template_cache_lock:
+                    cached = template_assets_cache.get(cache_key)
+            else:
+                cached = template_assets_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        base_map = self.get_assets_by_phashes(phash_list)
         assets = []
         for ph in phash_list or []:
-            try:
-                with self.conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT phash, filename, asset_type, file_size, producer, created_at "
-                        "FROM assets WHERE phash = %s", (ph,)
-                    )
-                    asset = cur.fetchone()
-            except:
-                asset = None
+            asset = base_map.get(ph)
             if not asset:
                 continue
-            asset['ancestors'] = self._get_derive_chain_up(ph)
-            asset['composed_from'] = self._get_compose_tree(ph)
-            assets.append(asset)
+            node = dict(asset)
+            node['ancestors'] = self._get_cached_derive_up(ph, local_cache)
+            node['composed_from'] = self._get_cached_compose(ph, local_cache)
+            assets.append(node)
+
+        if template_assets_cache is not None:
+            if template_cache_lock is not None:
+                with template_cache_lock:
+                    template_assets_cache[cache_key] = assets
+            else:
+                template_assets_cache[cache_key] = assets
+
         return assets
 
     def _fetch_canva_templates(self):
@@ -467,7 +521,24 @@ class DBManager:
             )
             return list(cur.fetchall())
 
-    def _build_lineage_from_base(self, base, canva_templates=None):
+    def _prepare_canva_templates(self, templates):
+        """预解析 Canva 模板中的素材列表，避免重复 JSON 反序列化。"""
+        prepared = []
+        for tmpl in templates or []:
+            t = dict(tmpl)
+            try:
+                phashes = json.loads(t['asset_phashes']) if t.get('asset_phashes') else []
+            except:
+                phashes = []
+            if not isinstance(phashes, list):
+                phashes = []
+            t['_asset_phashes'] = phashes
+            t['_asset_phash_set'] = set(phashes)
+            prepared.append(t)
+        return prepared
+
+    def _build_lineage_from_base(self, base, canva_templates=None, local_cache=None,
+                                 canva_assets_cache=None, canva_cache_lock=None):
         """基于已命中的基础资产构建完整溯源，避免重复 base 查询。"""
         exact = base['phash']
         result = {
@@ -488,7 +559,7 @@ class DBManager:
             """, (exact,))
             rows = list(cur.fetchall())
             for row in rows:
-                row['ancestors'] = self._get_derive_chain_up(row['src_phash'])
+                row['ancestors'] = self._get_cached_derive_up(row['src_phash'], local_cache)
             result["derived_from"] = rows
 
             # ── 向下衍生 + 递归后代链 ─────────────────────
@@ -500,10 +571,10 @@ class DBManager:
             """, (exact,))
             rows = list(cur.fetchall())
             for row in rows:
-                row['descendants'] = self._get_derive_chain_down(row['dst_phash'])
+                row['descendants'] = self._get_cached_derive_down(row['dst_phash'], local_cache)
             result["derived_to"] = rows
 
-        result["composed_from"] = self._get_compose_tree(exact)
+        result["composed_from"] = self._get_cached_compose(exact, local_cache)
 
         # Canva 关联匹配范围：当前素材 + 上游衍生 + 封装组件 + 组件祖先
         canva_scope = {exact}
@@ -520,13 +591,17 @@ class DBManager:
             """, (exact,))
             result["used_in"] = list(cur.fetchall())
 
-        tmpls = canva_templates if canva_templates is not None else self._fetch_canva_templates()
+        tmpls = canva_templates if canva_templates is not None else self._prepare_canva_templates(self._fetch_canva_templates())
         for tmpl in tmpls:
-            try:
-                phashes = json.loads(tmpl['asset_phashes']) if tmpl['asset_phashes'] else []
-            except:
-                phashes = []
-            phash_set = set(phashes)
+            phashes = tmpl.get('_asset_phashes')
+            if phashes is None:
+                try:
+                    phashes = json.loads(tmpl['asset_phashes']) if tmpl.get('asset_phashes') else []
+                except:
+                    phashes = []
+            phash_set = tmpl.get('_asset_phash_set')
+            if phash_set is None:
+                phash_set = set(phashes)
             if exact in phash_set:
                 mode = 'direct'
                 matched = [exact]
@@ -537,11 +612,16 @@ class DBManager:
             if not matched:
                 continue
 
-            t = dict(tmpl)
+            t = {k: v for k, v in tmpl.items() if not str(k).startswith('_')}
             t['match_mode'] = mode
             t['matched_phashes'] = matched
             t['matched_count'] = len(matched)
-            t['assets'] = self._build_canva_assets_lineage(phashes)
+            t['assets'] = self._build_canva_assets_lineage(
+                phashes,
+                local_cache=local_cache,
+                template_assets_cache=canva_assets_cache,
+                template_cache_lock=canva_cache_lock,
+            )
             result["canva_used"].append(t)
         return result
 
@@ -564,7 +644,9 @@ class DBManager:
             base = self.lookup(phash)
         if not base:
             return None
-        return self._build_lineage_from_base(base)
+        templates = self._prepare_canva_templates(self._fetch_canva_templates())
+        local_cache = {'derive_up': {}, 'derive_down': {}, 'compose': {}}
+        return self._build_lineage_from_base(base, templates, local_cache=local_cache)
 
     def get_lineage_batch(self, phashes, exact_only=True, workers=4):
         """批量溯源：先 SQL 批量取 base，再并发构建 lineage。"""
@@ -584,37 +666,57 @@ class DBManager:
                     if b:
                         base_map[ph] = b
 
-        canva_templates = self._fetch_canva_templates()
-        if workers <= 1 or len(uniq) <= 1:
+        canva_templates = self._prepare_canva_templates(self._fetch_canva_templates())
+        canva_assets_cache = {}
+        # 小批量时使用单连接串行更快：避免多线程重复建连与缓存预热开销。
+        if workers <= 1 or len(uniq) <= 20:
             out = {}
+            local_cache = {'derive_up': {}, 'derive_down': {}, 'compose': {}}
             for ph in uniq:
                 base = base_map.get(ph)
-                out[ph] = self._build_lineage_from_base(dict(base), canva_templates) if base else None
+                out[ph] = self._build_lineage_from_base(
+                    dict(base),
+                    canva_templates,
+                    local_cache=local_cache,
+                    canva_assets_cache=canva_assets_cache,
+                ) if base else None
             return out
 
         lock = threading.Lock()
-        thread_dbs = {}
+        canva_cache_lock = threading.Lock()
+        thread_states = {}
 
-        def get_thread_db():
+        def get_thread_state():
             tid = threading.get_ident()
             with lock:
-                existing = thread_dbs.get(tid)
+                existing = thread_states.get(tid)
                 if existing:
                     return existing
                 wdb = DBManager()
                 wdb.conf = dict(self.conf)
-                ok, msg = wdb.connect()
+                ok, msg = wdb.connect(init_tables=False, warm_cache=False)
                 if not ok:
                     raise RuntimeError(msg)
-                thread_dbs[tid] = wdb
-                return wdb
+                state = {
+                    'db': wdb,
+                    'local_cache': {'derive_up': {}, 'derive_down': {}, 'compose': {}},
+                }
+                thread_states[tid] = state
+                return state
 
         def process_one(ph):
             base = base_map.get(ph)
             if not base:
                 return ph, None
-            wdb = get_thread_db()
-            return ph, wdb._build_lineage_from_base(dict(base), canva_templates)
+            state = get_thread_state()
+            wdb = state['db']
+            return ph, wdb._build_lineage_from_base(
+                dict(base),
+                canva_templates,
+                local_cache=state['local_cache'],
+                canva_assets_cache=canva_assets_cache,
+                canva_cache_lock=canva_cache_lock,
+            )
 
         out = {ph: None for ph in uniq}
         try:
@@ -629,8 +731,8 @@ class DBManager:
                         out[ph] = None
         finally:
             with lock:
-                for wdb in thread_dbs.values():
-                    wdb.close()
+                for state in thread_states.values():
+                    state['db'].close()
 
         return out
 
@@ -650,10 +752,42 @@ class DBManager:
             phash_list = json.loads(tmpl['asset_phashes']) if tmpl['asset_phashes'] else []
         except:
             phash_list = []
-        assets = self._build_canva_assets_lineage(phash_list)
+        local_cache = {'derive_up': {}, 'derive_down': {}, 'compose': {}}
+        assets = self._build_canva_assets_lineage(phash_list, local_cache=local_cache)
         return {"template": tmpl, "assets": assets}
 
-    def _get_compose_tree(self, phash, visited=None, depth=0, max_depth=6):
+    def get_canva_template_assets_basic(self, template_id):
+        """轻量查询 Canva 模板及素材基础信息（不构建递归溯源树）。"""
+        if not self.conn:
+            return None
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM canva_templates WHERE template_id = %s",
+                (template_id.strip(),)
+            )
+            tmpl = cur.fetchone()
+        if not tmpl:
+            return None
+        try:
+            phash_list = json.loads(tmpl['asset_phashes']) if tmpl.get('asset_phashes') else []
+        except:
+            phash_list = []
+        base_map = self.get_assets_by_phashes(phash_list)
+        assets = []
+        for ph in phash_list:
+            a = base_map.get(ph)
+            if not a:
+                continue
+            assets.append({
+                'phash': a.get('phash'),
+                'filename': a.get('filename'),
+                'producer': a.get('producer'),
+                'asset_type': a.get('asset_type'),
+                'created_at': a.get('created_at'),
+            })
+        return {"template": tmpl, "assets": assets}
+
+    def _get_compose_tree(self, phash, visited=None, depth=0, max_depth=6, local_cache=None):
         """递归获取封装组件树：此 phash 由哪些组件构成（含组件自身的衍生祖先及子组件）"""
         if visited is None:
             visited = set()
@@ -673,8 +807,14 @@ class DBManager:
         except:
             return []
         for row in rows:
-            row['ancestors'] = self._get_derive_chain_up(row['part_phash'])
-            row['sub_parts'] = self._get_compose_tree(row['part_phash'], visited.copy(), depth + 1)
+            row['ancestors'] = self._get_cached_derive_up(row['part_phash'], local_cache)
+            row['sub_parts'] = self._get_compose_tree(
+                row['part_phash'],
+                visited.copy(),
+                depth + 1,
+                max_depth,
+                local_cache,
+            )
         return rows
 
     def get_ancestry_string(self, phash, visited=None, depth=0, max_depth=8):
@@ -735,6 +875,69 @@ class DBManager:
                 FROM assets ORDER BY created_at DESC LIMIT %s
             """, (limit,))
             return cur.fetchall()
+
+    def fix_wrong_producer(self, old_producer, new_producer,
+                           filename_keyword="", start_date=None, end_date=None):
+        """按条件批量修正作者，并同步 metadata_json 中 producer 字段。"""
+        if not self.conn:
+            return 0
+
+        old_name = (old_producer or "").strip()
+        new_name = (new_producer or "").strip()
+        if not old_name or not new_name or old_name == new_name:
+            return 0
+
+        where = ["producer = %s"]
+        params = [old_name]
+
+        keyword = (filename_keyword or "").strip()
+        if keyword:
+            where.append("filename LIKE %s")
+            params.append(f"%{keyword}%")
+
+        if start_date:
+            where.append("created_at >= %s")
+            params.append(f"{start_date} 00:00:00")
+
+        if end_date:
+            where.append("created_at <= %s")
+            params.append(f"{end_date} 23:59:59")
+
+        where_sql = " AND ".join(where)
+        select_sql = f"SELECT phash, metadata_json FROM assets WHERE {where_sql}"
+        update_sql = f"UPDATE assets SET producer = %s WHERE {where_sql}"
+
+        with self.conn.cursor() as cur:
+            cur.execute(select_sql, tuple(params))
+            rows = list(cur.fetchall())
+            cur.execute(update_sql, tuple([new_name] + params))
+            affected = cur.rowcount or 0
+
+        json_updates = []
+        for row in rows:
+            raw = row.get('metadata_json')
+            if not raw:
+                continue
+            try:
+                meta = json.loads(raw)
+            except:
+                continue
+            if not isinstance(meta, dict):
+                continue
+            meta['producer'] = new_name
+            json_updates.append((
+                json.dumps(meta, ensure_ascii=False, default=str),
+                row.get('phash')
+            ))
+
+        if json_updates:
+            with self.conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE assets SET metadata_json = %s WHERE phash = %s",
+                    json_updates
+                )
+
+        return affected
 
     def get_all_canva(self):
         if not self.conn:
